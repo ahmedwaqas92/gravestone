@@ -1,0 +1,27 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "gravestone",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "c11",
+      "intelliSenseMode": "linux-gcc-x64",
+      "includePath": [
+        "${workspaceFolder}/include",
+        "${workspaceFolder}/src/core",
+        "${workspaceFolder}/src/lib/window",
+        "${workspaceFolder}/src/lib/db",
+        "${workspaceFolder}/src/lib/paths",
+        "${workspaceFolder}/src/lib/proc",
+        "${workspaceFolder}/src/catalogue",
+        "${workspaceFolder}/src/library",
+        "${workspaceFolder}/src/detect",
+        "${workspaceFolder}/src/store",
+        "${workspaceFolder}/src/ui"
+      ],
+      "defines": [
+        "_POSIX_C_SOURCE=200809L"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "gravestone",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/gravestone",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "preLaunchTask": "make",
+      "environment": [
+        { "name": "GS_LOG", "value": "debug" }
+      ],
+      "setupCommands": [
+        {
+          "description": "readable structs and strings in the debugger",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "gravestone under sanitisers",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/gravestone",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "preLaunchTask": "make sanitise",
+      "environment": [
+        { "name": "GS_LOG", "value": "debug" },
+        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:detect_leaks=1" }
+      ],
+      "setupCommands": [
+        {
+          "description": "readable structs and strings in the debugger",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "window test",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/window_test",
+      "cwd": "${workspaceFolder}",
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "preLaunchTask": "make test"
+    },
+    {
+      "name": "ui test",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/ui_test",
+      "cwd": "${workspaceFolder}",
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "preLaunchTask": "make test"
+    }
+  ]
+}
