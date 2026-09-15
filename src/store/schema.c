@@ -33,6 +33,19 @@ const char *gs_store_schema =
     ");"
     "CREATE INDEX IF NOT EXISTS snapshot_by_time"
     "  ON snapshot(install_id, taken_at DESC);"
+    "CREATE TABLE IF NOT EXISTS setting ("
+    "  key        TEXT PRIMARY KEY,"
+    "  value      TEXT NOT NULL,"
+    "  updated_at INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS known_model ("
+    "  id      INTEGER PRIMARY KEY,"
+    "  name    TEXT NOT NULL UNIQUE,"
+    "  path    TEXT NOT NULL,"
+    "  root    TEXT NOT NULL,"
+    "  bytes   INTEGER NOT NULL,"
+    "  seen_at INTEGER NOT NULL"
+    ");"
     "CREATE TABLE IF NOT EXISTS snapshot_disk ("
     "  id          INTEGER PRIMARY KEY,"
     "  snapshot_id INTEGER NOT NULL REFERENCES snapshot(id) ON DELETE CASCADE,"
@@ -90,6 +103,15 @@ int gs_store_migrate(gs_db_t *handle, int *cleared)
                         "drives and the graphics card were recorded",
                         gs_db_changes(handle));
         }
+    }
+    if (version < 4) {
+        /* Settings and the model inventory arrived together, so a file
+         * written before them has neither table. Creating the schema
+         * above already made both, and the version marks the file as
+         * carrying them. */
+        if (gs_db_exec(handle, "PRAGMA user_version = 4;") != GS_OK)
+            return GS_ERR;
+        gs_log_info("store: database moved from version %lld to 4", version);
     }
     return GS_OK;
 }

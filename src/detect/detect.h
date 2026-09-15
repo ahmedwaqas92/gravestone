@@ -26,9 +26,30 @@ typedef struct {
     char      cpu_model[160];
     int       cpu_cores;          /* logical processors the system reports */
     long long ram_total_bytes;
+    /* What the kernel says could be handed out right now, which is memory
+     * nothing is holding plus the part of the file cache it can drop.
+     * Zero when the platform will not say. */
+    long long ram_free_bytes;
+    /* Non zero when a graphical session is running on this machine. A
+     * desktop brings a browser, a mail client and a window manager along
+     * with it, and none of those appear on a machine in a rack. */
+    int       desktop;
+    /* Non zero when this is a guest inside a larger machine, such as a
+     * virtual machine or a container. The memory reported is then an
+     * allowance carved out for the guest, and the programs the person has
+     * open are running outside it, so they cannot be charged against it. */
+    int       guest;
 
     char      gpu[160];
-    long long gpu_memory_bytes;   /* 0 when the card will not say */
+    /* Every card the machine can see, added together, since a model too
+     * large for one may still be split across two. Zero when no card
+     * will say what it holds. */
+    long long gpu_memory_bytes;
+    /* What is free on those cards at this moment. Graphics memory has few
+     * other tenants, so this reading holds still in a way the memory one
+     * does not. Zero when no card will say. */
+    long long gpu_free_bytes;
+    int       gpu_count;
 
     int               disk_count;
     gs_detect_disk_t  disk[GS_DETECT_MAX_DISKS];

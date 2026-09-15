@@ -16,6 +16,10 @@ typedef struct {
     char      name[160];     /* the file, without its directory */
     char      path[512];     /* where it sits */
     long long bytes;
+    /* How many tokens the model can hold at once, read from the file's
+     * own header. A token is a chunk of text, roughly three or four
+     * characters of English. Zero when the header would not say. */
+    long long context;
 } gs_library_entry_t;
 
 /* Walks the models directory under root and records what it finds.
@@ -59,6 +63,10 @@ void gs_library_pull_note_line(const char *line);
  * disk. Ollama grows partial files in blobs/ while it pulls, so this
  * number over the expected size is a measured download percentage. */
 long long gs_library_partial_bytes(const char *root);
+
+/* Reads the context window out of one GGUF file, the single file format
+ * llama.cpp reads. Zero when the file carries no such header. */
+long long gs_library_read_context(const char *path);
 
 void gs_library_release(void);
 

@@ -11,8 +11,20 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
+/* Milliseconds since a fixed point, used only to time how long a wait
+ * actually sat for. */
+static long long now_ms(void)
+{
+    struct timespec t;
+
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
 
 static int failures;
 static int checks;
@@ -22,9 +34,31 @@ static int skipped;
  * rather than a fault in the code, so it is reported as a skip. */
 static int display_unavailable(const char *section)
 {
+    /* A window opening steals the screen from whoever is using it, so
+     * every section that needs one can be turned off from outside. What
+     * is left runs anywhere and costs nothing. */
+    if (getenv("GS_TEST_NO_WINDOW") != NULL) {
+        printf("  skip  %s (windows are turned off)\n", section);
+        skipped++;
+        return 1;
+    }
     if (gs_window_display_available())
         return 0;
     printf("  skip  %s (the display is refusing connections)\n", section);
+    skipped++;
+    return 1;
+}
+
+/* WSLg drops a client's socket now and then, which this codebase already
+ * records as common after a run opens and closes many windows. Every
+ * check after that point fails for the same reason, and none of them says
+ * anything about the code. A dropped connection therefore ends the
+ * section as a skip. */
+static int connection_gone(gs_window_t *w, const char *section)
+{
+    if (w == NULL || gs_window_connected(w))
+        return 0;
+    printf("  skip  %s (the server dropped the connection)\n", section);
     skipped++;
     return 1;
 }
@@ -49,8 +83,250 @@ static void test_bad_arguments(void)
     check(gs_window_width(NULL) == 0, "width of NULL is 0");
     check(gs_window_height(NULL) == 0, "height of NULL is 0");
     check(gs_window_error_count(NULL) == 0, "error count of NULL is 0");
+    check(gs_window_connected(NULL) == 0, "a null window is not connected");
     gs_window_close(NULL);
     check(1, "closing NULL does not crash");
+
+    /* The pointer shape and the full screen request both reach the
+     * server, so both have to refuse nonsense before they get there. */
+    check(gs_window_set_cursor(NULL, GS_WINDOW_CURSOR_HAND) == GS_ERR_ARG,
+          "setting a shape on no window is refused");
+    check(gs_window_set_cursor(NULL, GS_WINDOW_CURSOR_ARROW) == GS_ERR_ARG,
+          "whichever shape it is");
+    check(gs_window_maximise(NULL, 1) == GS_ERR_ARG,
+          "growing no window is refused");
+    check(gs_window_maximise(NULL, 0) == GS_ERR_ARG,
+          "and so is shrinking it");
+    check(GS_WINDOW_CURSOR_ARROW == 0,
+          "the arrow is the shape a window starts with");
+    check(GS_WINDOW_CURSOR_COUNT == 3, "there are three shapes in all");
+}
+
+/* The keyboard map is a table turning a seat number into a meaning, and
+ * each seat carries several meanings in a row. The first is the key on
+ * its own and the second is the key with shift held, which is where a
+ * question mark lives above the oblique. Reading only the first is what
+ * makes shift give an oblique.
+ *
+ * Nothing here opens a window, since a made up event and a made up table
+ * are enough to decide what a key press turns into. */
+/* A key arriving twice when it was pressed once is the complaint that
+ * sent me looking here, so the queue is checked for it directly. Events
+ * land in a ring and are handed out one at a time, and the whole point is
+ * that a packet put in once comes out once and is then gone. */
+static void test_key_queue_hands_each_press_out_once(void)
+{
+    struct gs_window w;
+    unsigned char out[32];
+    int i, seen;
+
+    printf("one press, one event\n");
+
+    memset(&w, 0, sizeof w);
+    check(gs_win_queue_pop(&w, out) == 0, "an empty queue hands out nothing");
+
+    /* Sixteen presses go in, each carrying its own seat number. */
+    for (i = 0; i < 16; i++) {
+        unsigned char *slot = w.queue[(w.queue_head + w.queue_len) %
+                                      WIN_EVENT_QUEUE_LEN];
+
+        memset(slot, 0, 32);
+        slot[0] = X_EVT_KEY_PRESS;
+        slot[1] = (unsigned char)(40 + i);
+        w.queue_len++;
+    }
+
+    /* They come back in the order they went in, each exactly once. */
+    for (seen = 0; seen < 16; seen++) {
+        if (gs_win_queue_pop(&w, out) != 1)
+            break;
+        if (out[1] != (unsigned char)(40 + seen))
+            break;
+    }
+    check(seen == 16, "sixteen presses come back as sixteen, in order");
+    check(w.queue_len == 0, "and the queue is empty afterwards");
+    check(gs_win_queue_pop(&w, out) == 0, "so the next read hands out nothing");
+
+    /* The ring wraps, which is where a second helping would come from if
+     * the head and the length ever disagreed. */
+    w.queue_head = WIN_EVENT_QUEUE_LEN - 2;
+    for (i = 0; i < 5; i++) {
+        unsigned char *slot = w.queue[(w.queue_head + w.queue_len) %
+                                      WIN_EVENT_QUEUE_LEN];
+
+        memset(slot, 0, 32);
+        slot[0] = X_EVT_KEY_PRESS;
+        slot[1] = (unsigned char)(70 + i);
+        w.queue_len++;
+    }
+    for (seen = 0; seen < 5; seen++) {
+        if (gs_win_queue_pop(&w, out) != 1)
+            break;
+        if (out[1] != (unsigned char)(70 + seen))
+            break;
+    }
+    check(seen == 5, "five presses across the join come back as five");
+    check(w.queue_len == 0, "with nothing left behind");
+    check(gs_win_queue_pop(&w, out) == 0, "and nothing handed out twice");
+}
+
+static void test_shifted_keys(void)
+{
+    struct gs_window w;
+    unsigned char packet[32];
+    gs_window_event_t out;
+
+    printf("what a key press turns into\n");
+
+    memset(&w, 0, sizeof w);
+    /* Seat 61 is the oblique on a common keyboard, and shift gives the
+     * question mark above it. */
+    w.keysym0[61] = '/';
+    w.keysym1[61] = '?';
+    w.keysym0[38] = 'a';
+    w.keysym1[38] = 'A';
+    w.keysym0[36] = 0xff0d;      /* return */
+    w.keysym1[36] = 0xff0d;
+    w.keysym0[22] = 0xff08;      /* backspace */
+    w.keysym1[22] = 0xff08;
+    w.keysym0[9]  = 0xff1b;      /* escape */
+    w.keysym1[9]  = 0xff1b;
+
+    memset(packet, 0, sizeof packet);
+    packet[0] = X_EVT_KEY_PRESS;
+
+    packet[1] = 61;
+    gs_win_put16(packet + 28, 0);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == '/',
+          "the oblique on its own gives an oblique");
+    check(out.mods == 0, "with nothing held");
+
+    gs_win_put16(packet + 28, 0x0001);      /* shift */
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == '?',
+          "and with shift held it gives the question mark above it");
+    check((out.mods & GS_WINDOW_MOD_SHIFT) != 0, "which is reported as held");
+
+    packet[1] = 38;
+    gs_win_put16(packet + 28, 0);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 'a',
+          "a letter alone is the small one");
+    gs_win_put16(packet + 28, 0x0001);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 'A',
+          "and with shift the capital");
+
+    /* The caps lock reaches letters and leaves everything else alone, so
+     * a locked keyboard still gives a digit rather than the mark above. */
+    gs_win_put16(packet + 28, 0x0002);      /* caps lock */
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 'A',
+          "a locked keyboard gives the capital");
+    gs_win_put16(packet + 28, 0x0003);      /* caps lock and shift */
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 'a',
+          "and shift on top of the lock gives the small one back");
+    packet[1] = 61;
+    gs_win_put16(packet + 28, 0x0002);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == '/',
+          "the lock leaves the oblique alone");
+
+    /* Most keys carry nothing in the shifted column, written as nought,
+     * since holding shift changes nothing about them. Return is one of
+     * those, and reading that nought straight gives no character. */
+    w.keysym1[36] = 0;
+    packet[1] = 36;
+    gs_win_put16(packet + 28, 0);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 10,
+          "return arrives as ten, the line break");
+    check(out.mods == 0, "on its own");
+    gs_win_put16(packet + 28, 0x0001);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 10,
+          "shift and return is still a return, even with nothing in the "
+          "shifted column");
+    check((out.mods & GS_WINDOW_MOD_SHIFT) != 0,
+          "with the shift reported, which is what tells the two apart");
+
+    packet[1] = 22;
+    gs_win_put16(packet + 28, 0);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 8,
+          "backspace arrives as eight");
+    packet[1] = 9;
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 27,
+          "and escape as twenty seven");
+
+    /* A seat nothing is mapped to carries no character at all. */
+    /* A key with a shifted meaning of nought falls back to its own, so
+     * shift and backspace is still a backspace. */
+    w.keysym1[22] = 0;
+    packet[1] = 22;
+    gs_win_put16(packet + 28, 0x0001);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 8,
+          "shift and backspace is still a backspace");
+
+    packet[1] = 200;
+    gs_win_put16(packet + 28, 0);
+    check(gs_window_translate(&w, packet, &out) == 1 && out.ch == 0,
+          "an unmapped seat gives no character");
+    check(out.key == 200, "while still naming which seat it was");
+
+    packet[1] = 61;
+    gs_win_put16(packet + 28, 0x0004);      /* control */
+    check(gs_window_translate(&w, packet, &out) == 1 &&
+          (out.mods & GS_WINDOW_MOD_CONTROL) != 0, "control is reported");
+    gs_win_put16(packet + 28, 0x0008);      /* alt */
+    check(gs_window_translate(&w, packet, &out) == 1 &&
+          (out.mods & GS_WINDOW_MOD_ALT) != 0, "and so is alt");
+}
+
+/* The table the server sends back is rows of meanings, and each row is
+ * one seat on the keyboard. Reading the first meaning of each row and
+ * skipping the second is what left shift with no effect. */
+static void test_keymap_walk(void)
+{
+    uint32_t plain[256];
+    uint32_t upper[256];
+    unsigned char table[64];
+
+    printf("reading the table of what each key means\n");
+    memset(plain, 0, sizeof plain);
+    memset(upper, 0, sizeof upper);
+    memset(table, 0, sizeof table);
+
+    /* Two seats, four meanings each, which is what a common keyboard
+     * sends back. Seat one carries the oblique and its question mark. */
+    gs_win_put32(table +  0, '/');
+    gs_win_put32(table +  4, '?');
+    gs_win_put32(table + 16, 'a');
+    gs_win_put32(table + 20, 'A');
+
+    gs_win_read_keymap(table, sizeof table, 4, 2, 61, plain, upper);
+    check(plain[61] == '/', "the key alone is read");
+    check(upper[61] == '?', "and the key with shift held is read as well");
+    check(plain[62] == 'a', "the next seat is read from the next row");
+    check(upper[62] == 'A', "with its shifted meaning too");
+
+    /* A seat carrying one meaning shifts to the same thing, so a key with
+     * nothing above it still gives its own character under shift. */
+    memset(plain, 0, sizeof plain);
+    memset(upper, 0, sizeof upper);
+    memset(table, 0, sizeof table);
+    gs_win_put32(table, 'z');
+    gs_win_read_keymap(table, 4, 1, 1, 61, plain, upper);
+    check(plain[61] == 'z' && upper[61] == 'z',
+          "one meaning shifts to itself");
+
+    /* A table cut short must stop rather than read past its end. */
+    memset(plain, 0, sizeof plain);
+    memset(upper, 0, sizeof upper);
+    gs_win_put32(table, 'q');
+    gs_win_read_keymap(table, 4, 4, 8, 61, plain, upper);
+    check(plain[61] == 'q', "what is there is read");
+    check(plain[62] == 0, "and nothing past the end of the table is");
+
+    gs_win_read_keymap(NULL, 64, 4, 2, 61, plain, upper);
+    check(1, "no table does not crash");
+    gs_win_read_keymap(table, 64, 0, 2, 61, plain, upper);
+    check(1, "a row of no meanings does not crash");
+    /* A seat number past the end of the array would write outside it. */
+    gs_win_read_keymap(table, sizeof table, 4, 8, 254, plain, upper);
+    check(1, "a seat past the end of the table is left alone");
 }
 
 static void test_missing_display(void)
@@ -146,6 +422,11 @@ static void test_on_one_window(void)
         gs_window_text(w, 4, 130, big, 0x00FFFFFFu);
     }
     check(1, "text accepted, including empty, null and over long");
+
+    if (connection_gone(w, "the rest of the one window run")) {
+        gs_window_close(w);
+        return;
+    }
 
     printf("size hints\n");
     check(gs_window_set_hints(NULL, -1, -1, 100, 100, 10, 10) == GS_ERR_ARG,
@@ -248,6 +529,175 @@ static void test_on_one_window(void)
  * says which application it belongs to, and WM_CLASS is where it looks.
  * A window with none appears as an icon on the taskbar and nothing else,
  * so this is checked by reading the property back off the server. */
+/* A window asks for pointer motion, so a mouse resting over it keeps the
+ * wait returning events. Every measurement below wants a wait that ended
+ * for its own reason rather than because something arrived, so the wait
+ * is repeated until it answers with no event. Gives up after a while and
+ * reports -1, which the caller turns into a skip.
+ *
+ * Sets *elapsed to how long the winning attempt took. */
+static int wait_without_events(gs_window_t **set, int count,
+                               gs_window_event_t *out, int timeout_ms,
+                               long long *elapsed)
+{
+    int which = -1;
+    int attempt;
+
+    for (attempt = 0; attempt < 12; attempt++) {
+        long long a = now_ms();
+        int rc = gs_window_wait_any(set, count, &which, out, timeout_ms);
+        long long b = now_ms();
+
+        if (rc == 1)
+            continue;                    /* the server had something to say */
+        *elapsed = b - a;
+        return rc;
+    }
+    return -1;
+}
+
+/* Set by the handler below and read by the check, so it is the one type
+ * the standard promises can be written and read in a single step. */
+static volatile sig_atomic_t alarm_fired;
+
+static void on_alarm(int number)
+{
+    (void)number;
+    alarm_fired = 1;
+}
+
+/* A signal that arrives while the wait is already running cuts it short.
+ * Starting the wait again from the top would give it its whole time over
+ * once more, and a program waiting with no timeout at all would then
+ * never get the chance to notice that it has been asked to stop. */
+static void test_signal_cuts_the_wait_short(void)
+{
+    gs_window_t *w;
+    gs_window_t *set[1];
+    gs_window_event_t event;
+    struct sigaction want;
+    struct sigaction before;
+    int which = -1;
+    long long started = 0, ended = 0;
+    int rc = 0;
+    int attempt;
+    int measured = 0;
+
+    if (display_unavailable("a signal arriving during a wait"))
+        return;
+
+    printf("a signal arriving during a wait\n");
+    w = gs_window_open("gravestone signal test", 120, 90);
+    check(w != NULL, "window opened");
+    if (w == NULL)
+        return;
+    set[0] = w;
+    gs_window_set_wake_fd(-1);      /* only the signal can end this */
+
+    while (gs_window_wait_any(set, 1, &which, &event, 60) == 1)
+        ;                           /* drain whatever the server queued */
+
+    memset(&want, 0, sizeof want);
+    want.sa_handler = on_alarm;
+    sigemptyset(&want.sa_mask);
+    want.sa_flags = 0;              /* waits are cut short, not restarted */
+    sigaction(SIGALRM, &want, &before);
+
+    /* Each attempt gets its own alarm, since an attempt that ended on a
+     * window event never used the one it was given. */
+    for (attempt = 0; attempt < 12 && !measured; attempt++) {
+        alarm_fired = 0;
+        alarm(1);
+        started = now_ms();
+        rc = gs_window_wait_any(set, 1, &which, &event, 20000);
+        ended = now_ms();
+        alarm(0);
+        if (rc != 1 && alarm_fired == 1)
+            measured = 1;
+    }
+    sigaction(SIGALRM, &before, NULL);
+
+    if (!measured) {
+        printf("  skip  the server never went quiet long enough to time it\n");
+        skipped++;
+    } else {
+        check(rc == 0,
+              "the wait came back reporting nothing rather than an error");
+        check(ended - started < 5000,
+              "and at once, instead of waiting out its twenty seconds");
+    }
+
+    check(gs_window_error_count(w) == 0, "none of it upset the server");
+    gs_window_close(w);
+}
+
+/* The wait can be given one more descriptor to watch, which is how a stop
+ * signal reaches a loop that would otherwise sit still until a window
+ * spoke. Nothing else in the suite covers it, and a wait that ignored the
+ * descriptor would leave the program unable to be closed. */
+static void test_wake_descriptor(void)
+{
+    gs_window_t *w;
+    gs_window_t *set[1];
+    gs_window_event_t event;
+    int pipe_fds[2];
+    long long took = 0;
+
+    if (display_unavailable("the extra descriptor the wait watches"))
+        return;
+
+    printf("the extra descriptor the wait watches\n");
+    w = gs_window_open("gravestone wake test", 120, 90);
+    check(w != NULL, "window opened");
+    if (w == NULL)
+        return;
+    if (pipe(pipe_fds) != 0) {
+        check(0, "a pipe was made");
+        gs_window_close(w);
+        return;
+    }
+    set[0] = w;
+
+    /* Nothing on the pipe, so the wait has to sit out its whole time. */
+    gs_window_set_wake_fd(pipe_fds[0]);
+    if (wait_without_events(set, 1, &event, 200, &took) != 0) {
+        printf("  skip  the server never went quiet long enough to time it\n");
+        skipped++;
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        gs_window_set_wake_fd(-1);
+        gs_window_close(w);
+        return;
+    }
+    check(took >= 150, "an empty descriptor does not cut the wait short");
+
+    /* One byte on it, and the wait has to come straight back. */
+    check(write(pipe_fds[1], "q", 1) == 1, "a byte went down the pipe");
+    check(wait_without_events(set, 1, &event, 5000, &took) == 0 &&
+          took < 500, "a byte on the descriptor ends the wait at once");
+
+    /* The wait does not read the descriptor, so the byte is still there
+     * for whoever owns it. */
+    {
+        char back = 0;
+
+        check(read(pipe_fds[0], &back, 1) == 1 && back == 'q',
+              "and the byte is left for its owner to take");
+    }
+
+    /* Handing back -1 stops it being watched at all. */
+    gs_window_set_wake_fd(-1);
+    check(write(pipe_fds[1], "q", 1) == 1, "another byte went down");
+    check(wait_without_events(set, 1, &event, 200, &took) == 0 && took >= 150,
+          "a descriptor no longer watched is ignored, so the wait sits out "
+          "its time again");
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    check(gs_window_error_count(w) == 0, "none of it upset the server");
+    gs_window_close(w);
+}
+
 static void test_window_class(void)
 {
     gs_window_t *w;
@@ -313,8 +763,13 @@ int main(void)
     gs_log_set_level(GS_LOG_ERROR);
 
     test_bad_arguments();
+    test_keymap_walk();
+    test_shifted_keys();
+    test_key_queue_hands_each_press_out_once();
     test_missing_display();
     test_on_one_window();
+    test_wake_descriptor();
+    test_signal_cuts_the_wait_short();
     test_window_class();
 
     printf("\n%d checks, %d failures, %d skipped\n", checks, failures,

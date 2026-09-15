@@ -323,6 +323,140 @@ static void test_reopen_is_idempotent(void)
     check(1, "closing twice does not crash");
 }
 
+/* Settings and the model inventory, attacked at every edge that a
+ * caller could reach: keys never written, empty values, overwriting,
+ * a full table, and every null the API accepts. */
+static void test_settings(void)
+{
+    char out[64];
+    int i;
+
+    printf("settings kept between sessions\n");
+
+    /* A file of its own, so the counts start where this test expects. */
+    scrub();
+    if (gs_store_open() != GS_OK) {
+        check(0, "the store opened");
+        return;
+    }
+
+    check(gs_store_setting_count() == 0, "a fresh file carries no settings");
+    check(gs_store_setting_get("nothing", out, sizeof out) == GS_ERR,
+          "a key never written reports an error");
+    check(out[0] == '\0', "and leaves the buffer empty");
+
+    check(gs_store_setting_put("disk.mount", "/mnt/d") == GS_OK,
+          "a setting was written");
+    check(gs_store_setting_count() == 1, "and counted");
+    check(gs_store_setting_get("disk.mount", out, sizeof out) == GS_OK &&
+          strcmp(out, "/mnt/d") == 0, "and reads back the same text");
+
+    check(gs_store_setting_put("disk.mount", "/mnt/e") == GS_OK,
+          "the same key takes a new value");
+    check(gs_store_setting_count() == 1, "without growing the table");
+    check(gs_store_setting_get("disk.mount", out, sizeof out) == GS_OK &&
+          strcmp(out, "/mnt/e") == 0, "and the new value wins");
+
+    check(gs_store_setting_put("empty", "") == GS_OK,
+          "an empty value is allowed, since a cleared choice is a choice");
+    check(gs_store_setting_get("empty", out, sizeof out) == GS_OK &&
+          out[0] == '\0', "and reads back empty");
+
+    check(gs_store_setting_put(NULL, "x") == GS_ERR_ARG, "a null key is refused");
+    check(gs_store_setting_put("", "x") == GS_ERR_ARG, "an empty key is refused");
+    check(gs_store_setting_put("k", NULL) == GS_ERR_ARG, "a null value is refused");
+    check(gs_store_setting_get(NULL, out, sizeof out) == GS_ERR_ARG,
+          "reading a null key is refused");
+    check(gs_store_setting_get("disk.mount", NULL, 10) == GS_ERR_ARG,
+          "reading into nothing is refused");
+    check(gs_store_setting_get("disk.mount", out, 0) == GS_ERR_ARG,
+          "reading into no room is refused");
+
+    /* A value longer than the buffer comes back cut rather than over. */
+    {
+        char big[300];
+        char small[16];
+
+        memset(big, 'v', sizeof big - 1);
+        big[sizeof big - 1] = '\0';
+        check(gs_store_setting_put("long", big) == GS_OK,
+              "a three hundred byte value is written");
+        check(gs_store_setting_get("long", small, sizeof small) == GS_OK,
+              "and reads back into a small buffer");
+        check(strlen(small) == sizeof small - 1,
+              "cut to what the buffer holds");
+    }
+
+    printf("the model inventory\n");
+
+    check(gs_store_model_load() == 0, "a fresh file remembers no models");
+    check(gs_store_model_at(0) == NULL, "with no row to read");
+
+    check(gs_store_model_remember("a:1b", "/mnt/d/blobs/x", "/mnt/d", 100)
+          == GS_OK, "a model was remembered");
+    check(gs_store_model_remember("b:2b", "/mnt/d/blobs/y", "/mnt/d", 300)
+          == GS_OK, "and a second");
+    check(gs_store_model_remember("a:1b", "/mnt/e/blobs/z", "/mnt/e", 900)
+          == GS_OK, "the same name takes a new path and size");
+
+    check(gs_store_model_load() == 2, "two models come back, the repeat merged");
+    check(gs_store_model_at(0) != NULL &&
+          gs_store_model_at(0)->bytes == 900,
+          "the largest is first and carries its new size");
+    check(gs_store_model_at(0) != NULL &&
+          strcmp(gs_store_model_at(0)->root, "/mnt/e") == 0,
+          "and its new disk");
+    check(gs_store_model_at(-1) == NULL, "a negative index gives nothing");
+    check(gs_store_model_at(2) == NULL, "one past the end gives nothing");
+
+    check(gs_store_model_remember(NULL, "p", "r", 1) == GS_ERR_ARG,
+          "a null name is refused");
+    check(gs_store_model_remember("", "p", "r", 1) == GS_ERR_ARG,
+          "an empty name is refused");
+    check(gs_store_model_remember("n", NULL, "r", 1) == GS_ERR_ARG,
+          "a null path is refused");
+    check(gs_store_model_remember("n", "p", NULL, 1) == GS_ERR_ARG,
+          "a null disk is refused");
+    check(gs_store_model_remember("n", "p", "r", -5) == GS_ERR_ARG,
+          "a negative size is refused");
+    check(gs_store_model_load() == 2, "and none of those reached the table");
+
+    /* Filling past what the reader holds stops at its limit. */
+    for (i = 0; i < 600; i++) {
+        char name[32];
+
+        snprintf(name, sizeof name, "bulk-%d:1b", i);
+        gs_store_model_remember(name, "/p", "/r", 10 + i);
+    }
+    check(gs_store_model_load() == 512,
+          "a table larger than the reader fills it and stops");
+
+    check(gs_store_model_forget_all() == GS_OK, "the inventory was emptied");
+    check(gs_store_model_count() == 0, "and the reader emptied with it");
+    check(gs_store_model_load() == 0, "and the table is truly empty");
+
+    /* Everything written survives a close and a reopen, which is the
+     * whole point of putting it in a file. */
+    gs_store_setting_put("survives", "yes");
+    gs_store_model_remember("kept:1b", "/p", "/mnt/d", 42);
+    gs_store_close();
+    check(gs_store_open() == GS_OK, "the file reopened");
+    check(gs_store_setting_get("survives", out, sizeof out) == GS_OK &&
+          strcmp(out, "yes") == 0, "the setting outlived the session");
+    check(gs_store_model_load() == 1 && gs_store_model_at(0)->bytes == 42,
+          "and so did the inventory");
+
+    check(gs_store_setting_count() > 0, "settings exist before closing");
+    gs_store_close();
+    check(gs_store_setting_count() == 0,
+          "and reading with the file shut reports none rather than crashing");
+    check(gs_store_setting_put("k", "v") == GS_ERR_ARG,
+          "writing with the file shut is refused");
+    check(gs_store_model_remember("n", "p", "r", 1) == GS_ERR_ARG,
+          "remembering with the file shut is refused");
+    check(gs_store_model_load() == 0, "loading with the file shut reads none");
+}
+
 int main(void)
 {
     gs_log_set_level(GS_LOG_ERROR);
@@ -332,6 +466,7 @@ int main(void)
     test_mounting();
     test_migration_clears_old_readings();
     test_reopen_is_idempotent();
+    test_settings();
 
     scrub();
     gs_paths_override(NULL);

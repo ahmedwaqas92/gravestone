@@ -1,4 +1,5 @@
 #include "catalogue.h"
+#include "catalogue_internal.h"
 #include "gravestone.h"
 #include "log.h"
 #include "str.h"
@@ -7,12 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Weights alone do not run a model, since the working space for one reply
- * sits alongside them. A fifth on top is an allowance rather than a
- * measurement, and it has not been checked against a real run. */
-#define HEADROOM_NUM 6
-#define HEADROOM_DEN 5
 
 static gs_catalogue_entry_t *entries;
 static int entry_count;
@@ -145,32 +140,160 @@ const char *gs_catalogue_source(void)
     return source_path[0] != '\0' ? source_path : "nothing loaded";
 }
 
+
+long long gs_catalogue_needed(const long long *sizes, int n)
+{
+    long long total = 0;
+    int i;
+
+    if (sizes == NULL || n <= 0)
+        return 0;
+    for (i = 0; i < n; i++) {
+        if (sizes[i] <= 0)
+            continue;
+        total += sizes[i] / HEADROOM_DEN * HEADROOM_NUM;
+    }
+    return total;
+}
+
+int gs_catalogue_fit_many(const long long *sizes, int n,
+                          const gs_detect_report_t *machine)
+{
+    gs_catalogue_room_t room = gs_catalogue_room(machine);
+    long long have;
+    long long used = 0;
+    int i;
+
+    if (sizes == NULL || n <= 0 || machine == NULL)
+        return 0;
+
+    /* Models run at the same time, so their needs add up against the one
+     * pool of memory and graphics memory together. */
+    have = room.memory_bytes + room.graphics_bytes;
+    for (i = 0; i < n; i++) {
+        long long want;
+
+        if (sizes[i] <= 0)
+            return i;
+        want = sizes[i] / HEADROOM_DEN * HEADROOM_NUM;
+        if (used + want > have)
+            return i;
+        used += want;
+    }
+    return n;
+}
+
 gs_catalogue_fit_t gs_catalogue_fit(long long bytes,
                                     const gs_detect_report_t *machine)
 {
+    gs_catalogue_room_t room;
     long long needed;
 
     if (machine == NULL || bytes <= 0)
         return GS_FIT_NONE;
 
+    room = gs_catalogue_room(machine);
     needed = bytes / HEADROOM_DEN * HEADROOM_NUM;
 
-    if (machine->gpu_memory_bytes > 0 && needed <= machine->gpu_memory_bytes)
-        return GS_FIT_GRAPHICS;
-    if (needed <= machine->ram_total_bytes)
-        return GS_FIT_PROCESSOR;
-    if (machine->gpu_memory_bytes > 0 &&
-        needed <= machine->gpu_memory_bytes + machine->ram_total_bytes)
+    /* Both stores are asked, rather than the first one that answers,
+     * since a small model on a machine with a card and room to spare can
+     * run in either and a person choosing wants to see both. */
+    {
+        int on_card = room.graphics_bytes > 0 &&
+                      needed <= room.graphics_bytes;
+        int in_memory = needed <= room.memory_bytes;
+
+        if (on_card && in_memory)
+            return GS_FIT_EITHER;
+        if (on_card)
+            return GS_FIT_GRAPHICS;
+        if (in_memory)
+            return GS_FIT_PROCESSOR;
+    }
+
+    /* Neither store holds the whole model, so the layers are shared out
+     * between them, and every layer left in memory crosses the bus once
+     * for every word produced. This answers where a model would run, and
+     * says nothing about whether it is worth fetching, which
+     * gs_catalogue_listed decides. A model already on the disk runs
+     * however slowly it runs. */
+    if (needed <= room.memory_bytes + room.graphics_bytes)
         return GS_FIT_PARTIAL;
     return GS_FIT_NONE;
+}
+
+int gs_catalogue_listed(long long bytes, const gs_detect_report_t *machine)
+{
+    gs_catalogue_fit_t fit;
+
+    if (machine == NULL || bytes <= 0)
+        return 0;
+
+    fit = gs_catalogue_fit(bytes, machine);
+    if (fit == GS_FIT_NONE)
+        return 0;
+    if (!gs_catalogue_storable(bytes, machine))
+        return 0;
+    if (fit != GS_FIT_PARTIAL)
+        return 1;
+
+    /* A divided model with too little of itself on the card is left out,
+     * since it would load and then answer at a word a minute, which is a
+     * download wasted. Both sides are multiplied rather than divided,
+     * since dividing the left first throws away up to nine bytes, which
+     * is enough to admit a model a hair under the line. */
+    {
+        gs_catalogue_room_t room = gs_catalogue_room(machine);
+        long long needed = bytes / HEADROOM_DEN * HEADROOM_NUM;
+
+        return needed * SPLIT_FLOOR_NUM
+               <= room.graphics_bytes * SPLIT_FLOOR_DEN;
+    }
+}
+
+int gs_catalogue_storable(long long bytes,
+                          const gs_detect_report_t *machine)
+{
+    gs_catalogue_room_t room;
+
+    if (machine == NULL || bytes <= 0)
+        return 0;
+    room = gs_catalogue_room(machine);
+    /* One file sits on one disk, so the largest single disk decides
+     * rather than every disk added together. A machine reporting no disks
+     * at all is not held to this, since it has said nothing either way. */
+    if (room.largest_disk <= 0)
+        return 1;
+    return bytes <= room.largest_disk;
+}
+
+int gs_catalogue_conversational(gs_catalogue_fit_t fit)
+{
+    /* Every number in the file is read once for every word produced, so
+     * anything left in system memory crosses the bus once per word. A
+     * model that fits the card alone avoids that, whether or not it would
+     * also fit in memory. */
+    return fit == GS_FIT_GRAPHICS || fit == GS_FIT_EITHER;
+}
+
+const char *gs_catalogue_fit_tag(gs_catalogue_fit_t fit)
+{
+    switch (fit) {
+    case GS_FIT_EITHER:    return "GPU+CPU";
+    case GS_FIT_GRAPHICS:  return "GPU";
+    case GS_FIT_PROCESSOR: return "CPU";
+    case GS_FIT_PARTIAL:   return "SPLIT";
+    default:               return "NONE";
+    }
 }
 
 const char *gs_catalogue_fit_name(gs_catalogue_fit_t fit)
 {
     switch (fit) {
+    case GS_FIT_EITHER:    return "card or processor";
     case GS_FIT_GRAPHICS:  return "card";
-    case GS_FIT_PARTIAL:   return "split";
     case GS_FIT_PROCESSOR: return "processor";
+    case GS_FIT_PARTIAL:   return "split";
     default:               return "too large";
     }
 }
@@ -287,8 +410,12 @@ int gs_catalogue_runnable(const gs_detect_report_t *machine, int *indices,
     if (machine == NULL || indices == NULL || cap <= 0)
         return 0;
 
+    /* A row is listed when it could be kept and could be run, since the
+     * list is what a person picks a model to fetch from. Whether a model
+     * already on the disk can run is asked with gs_catalogue_fit alone,
+     * which has no opinion on free space. */
     for (i = 0; i < entry_count && n < cap; i++)
-        if (gs_catalogue_fit(entries[i].bytes, machine) != GS_FIT_NONE)
+        if (gs_catalogue_listed(entries[i].bytes, machine))
             indices[n++] = i;
 
     /* A caller with too small a buffer gets a short answer, and silence
@@ -300,88 +427,3 @@ int gs_catalogue_runnable(const gs_detect_report_t *machine, int *indices,
     qsort(indices, (size_t)n, sizeof *indices, by_size_desc);
     return n;
 }
-
-static int catalogue_init(void)
-{
-    return GS_OK;
-}
-
-static int catalogue_run(int argc, char **argv)
-{
-    gs_detect_report_t machine;
-    int *fits;
-    int n, i, shown = 0;
-
-    if (gs_catalogue_load() == 0) {
-        gs_log_error("catalogue: nothing to show");
-        return GS_ERR;
-    }
-    if (gs_detect_read(&machine) != GS_OK) {
-        gs_catalogue_release();
-        return GS_ERR;
-    }
-
-    fits = calloc(GS_CATALOGUE_MAX, sizeof *fits);
-    if (fits == NULL) {
-        gs_catalogue_release();
-        return GS_ERR_MEM;
-    }
-
-    /* "catalogue audit" prints every row with its category, runnable or
-     * not, so the classification can be read end to end. */
-    if (argc > 1 && strcmp(argv[1], "audit") == 0) {
-        for (i = 0; i < gs_catalogue_count(); i++) {
-            const gs_catalogue_entry_t *e = gs_catalogue_at(i);
-
-            printf("%s\t%s\t%s\n",
-                   gs_catalogue_kind_name(gs_catalogue_kind(e)),
-                   e->repository, e->file);
-        }
-        free(fits);
-        gs_catalogue_release();
-        return GS_OK;
-    }
-
-    n = gs_catalogue_runnable(&machine, fits, GS_CATALOGUE_MAX);
-    printf("source\t%s\n", gs_catalogue_source());
-    printf("known\t%d\n", gs_catalogue_count());
-    printf("runnable\t%d\n", n);
-
-    {
-        int per_kind[GS_KIND_COUNT] = {0};
-        int k;
-
-        for (i = 0; i < n; i++)
-            per_kind[gs_catalogue_kind(gs_catalogue_at(fits[i]))]++;
-        for (k = 0; k < (int)GS_KIND_COUNT; k++)
-            printf("kind\t%s\t%d\n",
-                   gs_catalogue_kind_name((gs_catalogue_kind_t)k),
-                   per_kind[k]);
-    }
-
-    for (i = 0; i < n && shown < 20; i++, shown++) {
-        const gs_catalogue_entry_t *e = gs_catalogue_at(fits[i]);
-
-        printf("%s\t%s\t%lld\t%s\t%s\n",
-               gs_catalogue_fit_name(gs_catalogue_fit(e->bytes, &machine)),
-               gs_catalogue_kind_name(gs_catalogue_kind(e)),
-               e->bytes, e->quantisation, e->file);
-    }
-
-    free(fits);
-    gs_catalogue_release();
-    return GS_OK;
-}
-
-static void catalogue_shutdown(void)
-{
-    gs_catalogue_release();
-}
-
-const gs_module gs_catalogue_module = {
-    "catalogue",
-    "list the models that could run on this machine",
-    catalogue_init,
-    catalogue_run,
-    catalogue_shutdown
-};

@@ -1,6 +1,7 @@
 #include "library.h"
 #include "gravestone.h"
 #include "http.h"
+#include "paths.h"
 #include "log.h"
 #include "proc.h"
 #include "str.h"
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -67,8 +69,20 @@ int gs_library_remove(int index)
             return GS_ERR;
         }
         snprintf(command, sizeof command, "ollama rm %s", entry->name);
-        if (gs_proc_capture(command, answer, sizeof answer) != GS_OK) {
-            gs_log_warn("library: ollama would not remove %s", entry->name);
+        /* The reason is kept rather than thrown away, since ollama rm
+         * talks to the server rather than to the disk, and a server that
+         * is not running is the commonest reason a removal fails. */
+        if (gs_proc_reason(command, answer, sizeof answer) != GS_OK) {
+            char *end = strchr(answer, '\n');
+
+            if (end != NULL)
+                *end = '\0';
+            if (answer[0] != '\0')
+                gs_log_warn("library: ollama would not remove %s: %s",
+                            entry->name, answer);
+            else
+                gs_log_warn("library: ollama would not remove %s, and "
+                            "said nothing about why", entry->name);
             return GS_ERR;
         }
         gs_log_info("library: removed %s through ollama", entry->name);
@@ -169,9 +183,9 @@ int gs_library_pull(const char *name, const char *root)
     if (root != NULL && root[0] != '\0' && strlen(root) < 300) {
         snprintf(dir, sizeof dir, "%s/%s",
                  strcmp(root, "/") == 0 ? "" : root, OLLAMA_SUBDIR);
-        (void)mkdir(dir, 0755);
+        (void)gs_paths_make_dir(dir);
         if (gs_library_dir(root, dir, sizeof dir) == GS_OK)
-            (void)mkdir(dir, 0755);
+            (void)gs_paths_make_dir(dir);
     }
 
     /* The daemon reports exact byte counts while it pulls, which is
@@ -264,6 +278,7 @@ static void remember(const char *name, const char *path, long long bytes)
     gs_str_copy(entries[entry_count].name, sizeof entries[0].name, name);
     gs_str_copy(entries[entry_count].path, sizeof entries[0].path, path);
     entries[entry_count].bytes = bytes;
+    entries[entry_count].context = gs_library_read_context(path);
     total_bytes += bytes;
     entry_count++;
 }
@@ -477,7 +492,7 @@ static int library_run(int argc, char **argv)
 
     for (i = 0; i < n; i++) {
         const gs_library_entry_t *e = gs_library_at(i);
-        printf("model\t%lld\t%s\n", e->bytes, e->name);
+        printf("model\t%lld\t%lld\t%s\n", e->bytes, e->context, e->name);
     }
 
     gs_library_release();

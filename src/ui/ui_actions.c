@@ -11,6 +11,7 @@
 #include "detect.h"
 #include "library.h"
 #include "log.h"
+#include "picker.h"
 #include "store.h"
 #include "str.h"
 #include "window.h"
@@ -19,6 +20,50 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+/* How long a reading of the machine stays good for, in seconds. */
+#define MACHINE_AGE 5
+
+const gs_detect_report_t *gs_ui_machine(void)
+{
+    static gs_detect_report_t held;
+    static time_t taken;
+    static int have;
+    time_t now = time(NULL);
+
+    /* Reading the machine starts the vendor tools, which cost about a
+     * third of a second on this laptop, so a panel repainting on every
+     * mouse move cannot do it for each row it draws. Free memory moves
+     * slowly enough that a reading a few seconds old decides a fit the
+     * same way a fresh one would.
+     *
+     * The stamp is written before the reading rather than after, so a
+     * machine whose tools fail is asked again on a timer instead of on
+     * every repaint. */
+    if (!have || now - taken >= MACHINE_AGE) {
+        gs_detect_report_t fresh;
+
+        taken = now;
+        if (gs_detect_read(&fresh) == GS_OK) {
+            /* The most graphics memory ever seen free is kept rather than
+             * the reading of this moment. A model that is loaded holds
+             * the card while it sits there, and asking whether it fits
+             * against a card it is already filling has it report itself
+             * as too large. Models are run one at a time, so the card
+             * comes back to this level between them.
+             *
+             * A desktop that grows its own use leaves this figure high,
+             * which reads as more room than there is. What a screen holds
+             * is small beside a model, so the error is small. */
+            if (have && fresh.gpu_free_bytes < held.gpu_free_bytes)
+                fresh.gpu_free_bytes = held.gpu_free_bytes;
+            held = fresh;
+            have = 1;
+        }
+    }
+    return have ? &held : NULL;
+}
 
 /* Reads the machine, writes it down, and works out what to say about it. */
 void gs_ui_refresh_state(gs_ui_state_t *state)
@@ -102,8 +147,23 @@ int gs_ui_scroll_under(gs_ui_state_t *state, gs_window_t *window, int x,
     int w = gs_window_width(window);
     int h = gs_window_height(window);
     int row = -1;
-    gs_ui_hit_t hit = gs_ui_hit_test(state, w, h, x, y, &row);
+    gs_ui_hit_t hit;
 
+    /* Over the history, the wheel moves the history. Its bar strip counts
+     * as the history too, since a hand resting on the bar means it. A
+     * notch arrives as three rows either way, and three rows of the
+     * history is three lines of a bubble. */
+    if (state->screen == GS_UI_SCREEN_HOME && !gs_ui_fleet_visible(state) &&
+        !gs_ui_record_showing(state)) {
+        gs_ui_rect_t seen = gs_ui_chat_history_rect(w, h);
+        gs_ui_rect_t bar = gs_ui_chat_bar_box(w, h);
+
+        if (gs_ui_rect_contains(seen, x, y) || gs_ui_rect_contains(bar, x, y))
+            return gs_ui_chat_scroll_by(state, w, h,
+                                        by * GS_UI_BUBBLE_LINE);
+    }
+
+    hit = gs_ui_hit_test(state, w, h, x, y, &row);
     switch (hit) {
     case GS_UI_HIT_LEFT_ROW:
         return scroll_rows(&state->model_scroll, state->model_count,
@@ -236,6 +296,19 @@ int gs_ui_add_progress(void)
     return gs_ui_progress_percent(0, removal.expected);
 }
 
+void gs_ui_remove_wait(void)
+{
+    if (!removal.running)
+        return;
+    pthread_join(removal.thread, NULL);
+    removal.running = 0;
+}
+
+int gs_ui_remove_running(void)
+{
+    return removal.running;
+}
+
 int gs_ui_remove_poll(gs_ui_state_t *state)
 {
     const gs_detect_disk_t *disk;
@@ -289,6 +362,99 @@ int gs_ui_remove_poll(gs_ui_state_t *state)
         snprintf(state->detail, sizeof state->detail,
                  "%s removed, shared layers kept the space", removal.name);
     }
+    gs_ui_settings_record_models(state);
     gs_log_info("ui: %s", state->detail);
     return 1;
+}
+
+/* The file box belongs to the system rather than to this program, and it
+ * does not come back until the person answers. Running it here would stop
+ * the window being painted for as long as the box is up, so it goes on a
+ * thread of its own, exactly as the removal does. */
+static struct {
+    pthread_t  thread;
+    atomic_int done;
+    int        result;
+    int        running;
+    char       path[GS_UI_ATTACH_PATH];
+} attach;
+
+static void *attach_worker(void *unused)
+{
+    (void)unused;
+    attach.result = gs_picker_open("Attach a file", attach.path,
+                                   sizeof attach.path);
+    atomic_store(&attach.done, 1);
+    return NULL;
+}
+
+int gs_ui_attach_begin(gs_ui_state_t *state)
+{
+    if (state == NULL)
+        return GS_ERR_ARG;
+    if (attach.running)
+        return GS_ERR;                  /* one box at a time */
+    if (state->attach_count >= GS_UI_ATTACH_MAX)
+        return GS_ERR;
+    if (!gs_picker_available()) {
+        gs_str_copy(state->status, sizeof state->status, "NO FILE BOX");
+        gs_str_copy(state->detail, sizeof state->detail,
+                    "this machine has no way to choose a file");
+        return GS_ERR;
+    }
+
+    attach.path[0] = '\0';
+    attach.result = GS_ERR;
+    atomic_store(&attach.done, 0);
+    if (pthread_create(&attach.thread, NULL, attach_worker, NULL) != 0)
+        return GS_ERR;
+    attach.running = 1;
+    state->attach_open = 1;
+    return GS_OK;
+}
+
+int gs_ui_attach_poll(gs_ui_state_t *state)
+{
+    if (state == NULL || !attach.running)
+        return 0;
+    if (!atomic_load(&attach.done))
+        return 0;
+
+    pthread_join(attach.thread, NULL);
+    attach.running = 0;
+    state->attach_open = 0;
+
+    if (attach.result == GS_OK && attach.path[0] != '\0' &&
+        state->attach_count < GS_UI_ATTACH_MAX) {
+        gs_str_copy(state->attached[state->attach_count],
+                    GS_UI_ATTACH_PATH, attach.path);
+        state->attach_count++;
+    }
+    return 1;
+}
+
+void gs_ui_attach_wait(void)
+{
+    if (!attach.running)
+        return;
+    pthread_join(attach.thread, NULL);
+    attach.running = 0;
+}
+
+int gs_ui_attach_running(void)
+{
+    return attach.running;
+}
+
+void gs_ui_attach_drop(gs_ui_state_t *state, int index)
+{
+    int i;
+
+    if (state == NULL || index < 0 || index >= state->attach_count)
+        return;
+    for (i = index; i + 1 < state->attach_count; i++)
+        gs_str_copy(state->attached[i], GS_UI_ATTACH_PATH,
+                    state->attached[i + 1]);
+    state->attach_count--;
+    state->attached[state->attach_count][0] = '\0';
 }

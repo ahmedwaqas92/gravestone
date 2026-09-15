@@ -231,7 +231,19 @@ void gs_ui_compose(unsigned int *pixels, int w, int h,
         state = &blank;
 
     gs_ui_compose_surface(pixels, w, h);
+
+    /* The home screen shares the ground and carries nothing else, so the
+     * bar and the panes are skipped rather than drawn and covered. */
+    if (state->screen == GS_UI_SCREEN_HOME) {
+        gs_ui_home_compose(pixels, w, h, state);
+        /* The password box sits over every screen, so it is drawn on
+         * both roads out of here rather than on one. */
+        gs_ui_secret_compose(pixels, w, h, state);
+        return;
+    }
+
     draw_bar(pixels, w, h, state);
     gs_ui_panes_compose(pixels, w, h, state);
     gs_ui_confirm_compose(pixels, w, h, state);
+    gs_ui_secret_compose(pixels, w, h, state);
 }

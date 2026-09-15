@@ -1,15 +1,17 @@
-/* detect.c
+/* detect_linux.c
  *
- * Linux reads /proc, which is a set of files the kernel writes on demand
- * rather than files on a disk. macOS and Windows would answer through
- * their own calls, and each belongs behind its own block here.
+ * Reading this machine on Linux, from the files the kernel keeps in
+ * /proc and from the mount table. /proc holds files the kernel writes on
+ * demand rather than files on a disk.
+ *
+ * The Windows reading lives in detect_win32.c. Both fill in the same
+ * report, so nothing above this directory knows which one ran.
  */
 #include "detect.h"
 #include "gravestone.h"
 #include "hash.h"
 #include "log.h"
 #include "str.h"
-#include "paths.h"
 #include "proc.h"
 
 #include <errno.h>
@@ -19,6 +21,7 @@
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+
 
 static void set_unknown(char *field, size_t cap)
 {
@@ -56,6 +59,76 @@ static int proc_field(const char *path, const char *key, char *out,
     }
     fclose(f);
     return found ? GS_OK : GS_ERR;
+}
+
+/* Whether anybody is sitting in front of this machine. A browser and a
+ * mail client only turn up where there is a screen to show them on, so a
+ * display server address in the environment is the evidence.
+ *
+ * The address has to name this machine. A session reached over ssh with
+ * forwarding carries a host in front of the colon, as in localhost:10.0,
+ * and the programs it draws are running on the machine at the far end.
+ * Charging a rack machine for somebody else's browser would refuse
+ * models it can run perfectly well. */
+static int desktop_running(void)
+{
+    const char *wayland = getenv("WAYLAND_DISPLAY");
+    const char *x11 = getenv("DISPLAY");
+
+    if (wayland != NULL && wayland[0] != '\0')
+        return 1;
+    return x11 != NULL && x11[0] == ':';
+}
+
+/* Whether this is a guest inside a larger machine. The memory a guest
+ * reports is an allowance somebody else decided, and the browser and the
+ * mail client are running outside that allowance, so charging the guest
+ * for them would refuse models it can run.
+ *
+ * A container is spotted by the marker its runtime leaves behind, and a
+ * virtual machine by the name the kernel gives itself. Nothing here asks
+ * a tool, since a guest with no tools installed is the common case. */
+static int running_as_guest(void)
+{
+    char text[256];
+    FILE *f;
+
+    if (access("/.dockerenv", F_OK) == 0)
+        return 1;
+    if (access("/run/.containerenv", F_OK) == 0)
+        return 1;
+
+    f = fopen("/proc/version", "r");
+    if (f != NULL) {
+        size_t got = fread(text, 1, sizeof text - 1, f);
+
+        fclose(f);
+        text[got] = '\0';
+        /* WSL names itself in the kernel version string. */
+        if (strstr(text, "microsoft") != NULL ||
+            strstr(text, "Microsoft") != NULL)
+            return 1;
+    }
+
+    f = fopen("/sys/class/dmi/id/product_name", "r");
+    if (f != NULL) {
+        char *end;
+
+        if (fgets(text, sizeof text, f) == NULL)
+            text[0] = '\0';
+        fclose(f);
+        end = strchr(text, '\n');
+        if (end != NULL)
+            *end = '\0';
+        /* The names the common hypervisors write into the firmware. */
+        if (strstr(text, "VirtualBox") != NULL ||
+            strstr(text, "VMware") != NULL ||
+            strstr(text, "KVM") != NULL ||
+            strstr(text, "Virtual Machine") != NULL ||
+            strstr(text, "HVM domU") != NULL)
+            return 1;
+    }
+    return 0;
 }
 
 static long long meminfo_kb(const char *key)
@@ -199,29 +272,68 @@ static void read_disks(gs_detect_report_t *out)
  * where the field reads "unknown" rather than a guess. */
 static void read_gpu(gs_detect_report_t *out)
 {
-    char answer[512];
+    /* Room for a long list, since one line runs about fifty characters
+     * and a machine with a dozen cards would be cut short by a smaller
+     * buffer, losing memory that a model could have used. */
+    char answer[2048];
     char *comma;
 
     set_unknown(out->gpu, sizeof out->gpu);
     out->gpu_memory_bytes = 0;
+    out->gpu_free_bytes = 0;
 
-    /* A hung tool must never hold the interface still, so it is given five
-     * seconds and no more. */
+    /* Every card the machine can see counts, since a model too large for
+     * one may still be split across two. The memory of all of them is
+     * added up and the first one names the set.
+     *
+     * A hung tool must never hold the interface still, so it is given
+     * five seconds and no more. */
     if (gs_proc_capture(
-            "timeout 5 nvidia-smi --query-gpu=name,memory.total "
+            "timeout 5 nvidia-smi --query-gpu=name,memory.total,memory.free "
             "--format=csv,noheader", answer, sizeof answer) == GS_OK) {
-        answer[strcspn(answer, "\n")] = '\0';
-        comma = strchr(answer, ',');
-        if (comma != NULL) {
-            long long mib;
+        char *line = answer;
+        int cards = 0;
 
-            *comma = '\0';
-            mib = strtoll(comma + 1, NULL, 10);
-            if (mib > 0)
-                out->gpu_memory_bytes = mib * 1024 * 1024;
+        while (line != NULL && *line != '\0') {
+            char *end = strchr(line, '\n');
+
+            if (end != NULL)
+                *end = '\0';
+            comma = strchr(line, ',');
+            if (comma != NULL) {
+                long long mib;
+                char *second;
+
+                *comma = '\0';
+                mib = strtoll(comma + 1, NULL, 10);
+                if (mib > 0)
+                    out->gpu_memory_bytes += mib * 1024 * 1024;
+                /* The free figure follows the total on the same line. A
+                 * card that will not say leaves it at nought, which the
+                 * room maths reads as no reading rather than no memory. */
+                second = strchr(comma + 1, ',');
+                if (second != NULL) {
+                    long long spare = strtoll(second + 1, NULL, 10);
+
+                    if (spare > 0)
+                        out->gpu_free_bytes += spare * 1024 * 1024;
+                }
+                if (cards == 0)
+                    gs_str_copy(out->gpu, sizeof out->gpu, line);
+                cards++;
+            }
+            line = end != NULL ? end + 1 : NULL;
         }
-        gs_str_copy(out->gpu, sizeof out->gpu, answer);
-        return;
+        if (cards > 1) {
+            char many[sizeof out->gpu + 24];
+
+            snprintf(many, sizeof many, "%s and %d more", out->gpu,
+                     cards - 1);
+            gs_str_copy(out->gpu, sizeof out->gpu, many);
+        }
+        out->gpu_count = cards;
+        if (cards > 0)
+            return;
     }
 
     if (gs_proc_capture(
@@ -230,13 +342,17 @@ static void read_gpu(gs_detect_report_t *out)
         char *colon = strrchr(answer, ':');
         gs_str_copy(out->gpu, sizeof out->gpu,
                     colon != NULL ? colon + 1 : answer);
+        /* Named without its memory, and still one card. */
+        out->gpu_count = 1;
         return;
     }
 
     if (gs_proc_capture(
             "cat /sys/class/drm/card0/device/label 2>/dev/null",
-            answer, sizeof answer) == GS_OK)
+            answer, sizeof answer) == GS_OK) {
         gs_str_copy(out->gpu, sizeof out->gpu, answer);
+        out->gpu_count = 1;
+    }
 }
 
 int gs_detect_read(gs_detect_report_t *out)
@@ -271,6 +387,18 @@ int gs_detect_read(gs_detect_report_t *out)
     kb = meminfo_kb("MemTotal");
     out->ram_total_bytes = kb * 1024;
 
+    /* MemAvailable is the kernel's own estimate of what a new allocation
+     * could take without pushing anything out to swap, so it counts the
+     * reclaimable part of the file cache. An older kernel without the
+     * field falls back to MemFree, which understates it. */
+    kb = meminfo_kb("MemAvailable");
+    if (kb <= 0)
+        kb = meminfo_kb("MemFree");
+    out->ram_free_bytes = kb * 1024;
+
+    out->desktop = desktop_running();
+    out->guest = running_as_guest();
+
     read_disks(out);
     read_gpu(out);
 
@@ -281,106 +409,3 @@ int gs_detect_read(gs_detect_report_t *out)
     return GS_OK;
 }
 
-int gs_detect_fingerprint(const gs_detect_report_t *report, char *out,
-                          size_t cap)
-{
-    char material[1024];
-
-    if (report == NULL || out == NULL || cap < 17)
-        return GS_ERR_ARG;
-
-    /* Free space is left out, since it changes constantly and would make
-     * every launch look like new hardware. */
-    {
-        int used = snprintf(material, sizeof material,
-                            "%s|%s|%s|%s|%d|%lld|%s|%lld",
-                            report->os, report->kernel, report->arch,
-                            report->cpu_model, report->cpu_cores,
-                            report->ram_total_bytes, report->gpu,
-                            report->gpu_memory_bytes);
-        int i;
-
-        for (i = 0; i < report->disk_count && used > 0 &&
-                    (size_t)used < sizeof material; i++)
-            used += snprintf(material + used, sizeof material - (size_t)used,
-                             "|%s:%s:%lld", report->disk[i].mount,
-                             report->disk[i].fs,
-                             report->disk[i].total_bytes);
-    }
-
-    return gs_hash_hex(gs_hash_text(material), out, cap);
-}
-
-int gs_detect_describe(const gs_detect_report_t *report, char *out,
-                       size_t cap)
-{
-    if (report == NULL || out == NULL || cap == 0)
-        return GS_ERR_ARG;
-
-    {
-        int used = snprintf(out, cap,
-            "os\t%s\n"
-            "kernel\t%s\n"
-            "arch\t%s\n"
-            "cpu\t%s\n"
-            "cores\t%d\n"
-            "ram\t%lld\n"
-            "gpu\t%s\n"
-            "gpu_memory\t%lld\n"
-            "disk_total\t%lld\n"
-            "disk_free\t%lld\n"
-            "disks\t%d\n",
-            report->os, report->kernel, report->arch, report->cpu_model,
-            report->cpu_cores, report->ram_total_bytes, report->gpu,
-            report->gpu_memory_bytes, report->disk_total_bytes,
-            report->disk_free_bytes, report->disk_count);
-        int i;
-
-        for (i = 0; i < report->disk_count && used > 0 &&
-                    (size_t)used < cap; i++)
-            used += snprintf(out + used, cap - (size_t)used,
-                             "disk\t%s\t%s\t%s\t%lld\t%lld\n",
-                             report->disk[i].mount, report->disk[i].device,
-                             report->disk[i].fs, report->disk[i].total_bytes,
-                             report->disk[i].free_bytes);
-        return used;
-    }
-}
-
-static int detect_init(void)
-{
-    return GS_OK;
-}
-
-static int detect_run(int argc, char **argv)
-{
-    gs_detect_report_t report;
-    char text[2048];
-    char print[17];
-
-    (void)argc;
-    (void)argv;
-
-    if (gs_detect_read(&report) != GS_OK) {
-        gs_log_error("detect: could not read the machine");
-        return GS_ERR;
-    }
-    gs_detect_describe(&report, text, sizeof text);
-    gs_detect_fingerprint(&report, print, sizeof print);
-
-    printf("%s", text);
-    printf("fingerprint\t%s\n", print);
-    return GS_OK;
-}
-
-static void detect_shutdown(void)
-{
-}
-
-const gs_module gs_detect_module = {
-    "detect",
-    "read this machine and print what it is",
-    detect_init,
-    detect_run,
-    detect_shutdown
-};

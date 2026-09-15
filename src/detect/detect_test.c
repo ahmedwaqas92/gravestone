@@ -50,6 +50,28 @@ int main(void)
     printf("        graphics: %s, %lld bytes on the card\n",
            a.gpu, a.gpu_memory_bytes);
 
+    /* Free memory decides whether a model runs or crawls, so it is read
+     * alongside the totals rather than assumed from them. Nought means
+     * the platform would not say, which the room maths reads as no
+     * reading rather than as no memory. */
+    printf("what is free rather than what is fitted\n");
+    printf("        memory %lld free of %lld, graphics %lld free of %lld,"
+           " desktop %d\n",
+           a.ram_free_bytes, a.ram_total_bytes,
+           a.gpu_free_bytes, a.gpu_memory_bytes, a.desktop);
+    check(a.ram_free_bytes >= 0, "free memory is not negative");
+    check(a.ram_free_bytes <= a.ram_total_bytes,
+          "free memory fits inside the memory fitted");
+    check(a.ram_free_bytes > 0, "and this machine reported some");
+    check(a.gpu_free_bytes >= 0, "free graphics memory is not negative");
+    check(a.gpu_free_bytes <= a.gpu_memory_bytes,
+          "and fits inside the graphics memory fitted");
+    check(a.desktop == 0 || a.desktop == 1, "the desktop flag is a flag");
+    check(a.guest == 0 || a.guest == 1, "and so is the guest flag");
+    /* A guest reports memory somebody else decided on, so what is open on
+     * the machine around it cannot be charged against the allowance. */
+    printf("        guest %d\n", a.guest);
+
     printf("every disk, rather than one\n");
     printf("        %d disks found\n", a.disk_count);
     check(a.disk_count >= 1, "at least one disk was found");

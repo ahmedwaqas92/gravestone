@@ -145,20 +145,64 @@ int gs_window_translate(gs_window_t *window,
     }
 
     case X_EVT_KEY_PRESS: {
-        uint32_t sym = window->keysym0[packet[1]];
+        /* The keys held down while this one went down. Bit nought is
+         * shift, bit one is the caps lock, and bit two is control. */
+        uint16_t held = gs_win_get16(packet + 28);
+        int shift = (held & 0x0001u) != 0;
+        int lock  = (held & 0x0002u) != 0;
+        uint32_t plain = window->keysym0[packet[1]];
+        uint32_t upper = window->keysym1[packet[1]];
+        uint32_t sym;
+
+        /* Most keys carry nothing in the shifted column, written as
+         * nought, because holding shift changes nothing about them. The
+         * return key is one of those, so reading the column straight gave
+         * no character at all and shift with return did nothing. */
+        if (upper == 0)
+            upper = plain;
 
         out->kind = GS_WINDOW_EVENT_KEY;
         out->key = packet[1];            /* raw keycode */
         out->ch = 0;
+        out->mods = 0;
+        if (shift)
+            out->mods |= GS_WINDOW_MOD_SHIFT;
+        if (held & 0x0004u)
+            out->mods |= GS_WINDOW_MOD_CONTROL;
+        if (held & 0x0008u)
+            out->mods |= GS_WINDOW_MOD_ALT;
+
+        /* The caps lock only reaches letters, so a locked keyboard still
+         * gives a digit rather than the mark above it. */
+        if (lock && !shift && plain >= 'a' && plain <= 'z')
+            sym = upper;
+        else if (lock && shift && plain >= 'a' && plain <= 'z')
+            sym = plain;
+        else
+            sym = shift ? upper : plain;
+
         if (sym >= 0x20 && sym <= 0x7e)
             out->ch = (int)sym;          /* plain printable character */
         else if (sym == 0xff08)
             out->ch = 8;                 /* backspace */
+        else if (sym == 0xff1b)
+            out->ch = 27;                /* escape */
+        else if (sym == 0xff0d || sym == 0xff8d)
+            out->ch = 10;                /* return, and the one on the pad */
+        else if (sym == 0xff09)
+            out->ch = 9;                 /* tab */
         return 1;
     }
 
     case X_EVT_BUTTON_PRESS:
         out->kind = GS_WINDOW_EVENT_CLICK;
+        out->button = packet[1];
+        out->x = (int)(int16_t)gs_win_get16(packet + 24);
+        out->y = (int)(int16_t)gs_win_get16(packet + 26);
+        return 1;
+
+    case X_EVT_BUTTON_RELEASE:
+        out->kind = GS_WINDOW_EVENT_RELEASE;
         out->button = packet[1];
         out->x = (int)(int16_t)gs_win_get16(packet + 24);
         out->y = (int)(int16_t)gs_win_get16(packet + 26);
@@ -206,8 +250,11 @@ int gs_window_wait_event(gs_window_t *window, gs_window_event_t *out,
         {
             int ready = poll(&pfd, 1, timeout_ms);
             if (ready < 0) {
+                /* Cut short by a signal, which reads as a wait that found
+                 * nothing. Going round again would start the timeout over
+                 * and the caller would never get its turn. */
                 if (errno == EINTR)
-                    continue;
+                    return 0;
                 gs_log_error("window: poll failed: %s", strerror(errno));
                 window->broken = 1;
                 return GS_ERR_IO;
@@ -464,15 +511,25 @@ int gs_window_blit_rect(gs_window_t *window, const unsigned int *pixels,
 }
 
 
+/* Set by whoever has something other than a window to answer. Watched by
+ * the wait, never read from and never closed here. */
+static int wake_fd = -1;
+
+void gs_window_set_wake_fd(int fd)
+{
+    wake_fd = fd;
+}
+
 int gs_window_wait_any(gs_window_t **windows, int count, int *which,
                        gs_window_event_t *out, int timeout_ms)
 {
-    struct pollfd fds[8];
+    struct pollfd fds[9];           /* eight windows and the wake pipe */
+    int watched;
     unsigned char packet[32];
     int i;
 
     if (windows == NULL || out == NULL || which == NULL || count <= 0 ||
-        count > (int)(sizeof fds / sizeof fds[0]))
+        count > (int)(sizeof fds / sizeof fds[0]) - 1)
         return GS_ERR_ARG;
 
     memset(out, 0, sizeof *out);
@@ -508,18 +565,35 @@ int gs_window_wait_any(gs_window_t **windows, int count, int *which,
             fds[i].events = POLLIN;
             fds[i].revents = 0;
         }
+        watched = count;
+        if (wake_fd >= 0) {
+            fds[watched].fd = wake_fd;
+            fds[watched].events = POLLIN;
+            fds[watched].revents = 0;
+            watched++;
+        }
 
         {
-            int ready = poll(fds, (nfds_t)count, timeout_ms);
+            int ready = poll(fds, (nfds_t)watched, timeout_ms);
             if (ready < 0) {
+                /* A signal cut the wait short. Going round again would
+                 * start the whole timeout over and never hand control
+                 * back, so this reads as a wait that found nothing and
+                 * the caller decides what to do next. */
                 if (errno == EINTR)
-                    continue;
+                    return 0;
                 gs_log_error("window: poll failed: %s", strerror(errno));
                 return GS_ERR_IO;
             }
             if (ready == 0)
                 return 0;
         }
+
+        /* Something arrived on the extra descriptor, so the caller is
+         * told at once rather than after the windows are drained. Nothing
+         * is read from it here, since it belongs to the caller. */
+        if (wake_fd >= 0 && (fds[count].revents & (POLLIN | POLLHUP)) != 0)
+            return 0;
 
         for (i = 0; i < count; i++)
             if ((fds[i].revents & POLLIN) && windows[i] != NULL)

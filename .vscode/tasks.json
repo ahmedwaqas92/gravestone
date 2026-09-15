@@ -2,6 +2,20 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "prepare the display",
+      "detail": "checks a screen exists, and repairs WSLg when it carries no pixels",
+      "type": "shell",
+      "command": "sh tools/display.sh || true",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated"
+      }
+    },
+    {
       "label": "make",
       "type": "shell",
       "command": "make",
@@ -25,14 +39,17 @@
       "label": "run gravestone",
       "detail": "builds, then opens the window in a terminal of its own",
       "type": "shell",
-      "command": "./build/gravestone",
+      "command": "sh tools/run.sh",
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
           "GS_LOG": "debug"
         }
       },
-      "dependsOn": "make",
+      "dependsOn": [
+        "make",
+        "prepare the display"
+      ],
       "problemMatcher": [],
       "presentation": {
         "reveal": "always",
@@ -40,7 +57,8 @@
         "clear": true,
         "focus": false,
         "showReuseMessage": false
-      }
+      },
+      "dependsOrder": "sequence"
     },
     {
       "label": "make test",

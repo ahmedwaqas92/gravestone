@@ -15,7 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 static int failures;
 static int checks;
@@ -39,18 +44,39 @@ static int serve_port;
 static void *serve_once(void *arg)
 {
     int fd = (int)(long)arg;
-    int client = accept(fd, NULL, NULL);
+    int client;
+    struct timeval patience = {5, 0};
+
+    /* A caller that gave up before connecting would otherwise leave this
+     * thread waiting for ever, and the suite waiting with it. */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof patience);
+    client = accept(fd, NULL, NULL);
     char sink[2048];
 
     if (client >= 0) {
-        ssize_t got = read(client, sink, sizeof sink);
+        ssize_t got;
+
+#ifdef SO_NOSIGPIPE
+        /* Where the flag on each call does not exist, the socket carries
+         * it instead, so a test that stops reading does not end this. */
+        {
+            int quiet = 1;
+
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &quiet,
+                       sizeof quiet);
+        }
+#endif
+        got = read(client, sink, sizeof sink);
         size_t i;
 
         (void)got;
         /* Sent one byte at a time, so every fragment boundary the parser
-         * could mishandle is exercised on every run. */
+         * could mishandle is exercised on every run. A test that stops
+         * reading part way through leaves this writing into a closed
+         * socket, and send is used rather than write so that arrives as
+         * an error rather than as a signal that ends the test. */
         for (i = 0; i < strlen(canned); i++)
-            if (write(client, canned + i, 1) != 1)
+            if (send(client, canned + i, 1, MSG_NOSIGNAL) != 1)
                 break;
         close(client);
     }

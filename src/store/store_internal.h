@@ -10,4 +10,8 @@ extern const char *gs_store_schema;
 
 int gs_store_migrate(gs_db_t *handle, int *cleared);
 
+/* The open database, for the queries that live in a second file. NULL
+ * before gs_store_open and after gs_store_close. */
+gs_db_t *gs_store_handle(void);
+
 #endif

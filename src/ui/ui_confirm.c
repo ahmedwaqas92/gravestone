@@ -243,10 +243,10 @@ void gs_ui_confirm_labels(gs_window_t *win, const gs_ui_state_t *state)
 
         ok = gs_ui_confirm_ok_rect(w, h);
         no = gs_ui_confirm_no_rect(w, h);
-        gs_window_text(win, ok.x + (ok.w - 3 * 6) / 2,
+        gs_window_text(win, ok.x + (ok.w - 3 * gs_ui_glyph_width()) / 2,
                        ok.y + (ok.h + gs_window_font_ascent(win)) / 2 - 1,
                        "Add", GS_UI_BTN_LABEL);
-        gs_window_text(win, no.x + (no.w - 6 * 6) / 2,
+        gs_window_text(win, no.x + (no.w - 6 * gs_ui_glyph_width()) / 2,
                        no.y + (no.h + gs_window_font_ascent(win)) / 2 - 1,
                        "Cancel", GS_UI_BTN_LABEL);
         return;

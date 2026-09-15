@@ -5,6 +5,8 @@
  * so no hardware is read and no network is touched.
  */
 #include "catalogue.h"
+#include "catalogue_internal.h"
+#include "catalogue_test.h"
 #include "gravestone.h"
 #include "detect.h"
 #include "log.h"
@@ -17,7 +19,7 @@
 static int failures;
 static int checks;
 
-static void check(int condition, const char *what)
+void gs_catalogue_test_check(int condition, const char *what)
 {
     checks++;
     if (condition) {
@@ -29,7 +31,7 @@ static void check(int condition, const char *what)
 }
 
 /* A machine with the memory sizes handed in and nothing else filled. */
-static gs_detect_report_t machine_of(long long ram, long long vram)
+gs_detect_report_t gs_catalogue_test_machine(long long ram, long long vram)
 {
     gs_detect_report_t m;
 
@@ -75,47 +77,8 @@ static void test_loading(void)
     check(gs_catalogue_load() == n, "a second load reports the same count");
 }
 
-static void test_fit_arithmetic(void)
-{
-    gs_detect_report_t none = machine_of(0, 0);
-    gs_detect_report_t cpu_only = machine_of(8000000000LL, 0);
-    gs_detect_report_t card = machine_of(4000000000LL, 6000000000LL);
-
-    printf("the fit rule\n");
-
-    /* needed = bytes / 5 * 6, with the division truncating first. */
-    check(gs_catalogue_fit(5, &cpu_only) == GS_FIT_PROCESSOR,
-          "5 bytes needs 6 and fits in system memory");
-    check(gs_catalogue_fit(9, &none) == GS_FIT_NONE,
-          "nothing fits on a machine with no memory at all");
-    check(gs_catalogue_fit(0, &cpu_only) == GS_FIT_NONE,
-          "a zero sized file never fits");
-    check(gs_catalogue_fit(-1, &cpu_only) == GS_FIT_NONE,
-          "a negative size never fits");
-    check(gs_catalogue_fit(1000, NULL) == GS_FIT_NONE,
-          "a null machine never fits");
-
-    /* 6,666,666,666 / 5 * 6 = 7,999,999,998, one under the limit. */
-    check(gs_catalogue_fit(6666666666LL, &cpu_only) == GS_FIT_PROCESSOR,
-          "the largest model that fits in 8 GB of system memory");
-    check(gs_catalogue_fit(6666666670LL, &cpu_only) == GS_FIT_NONE,
-          "four bytes more does not fit");
-
-    /* The card is asked first, so anything inside it answers GRAPHICS. */
-    check(gs_catalogue_fit(1000000000LL, &card) == GS_FIT_GRAPHICS,
-          "a small model lands on the card");
-    /* 7,000,000,000 / 5 * 6 = 8,400,000,000, over the card and over
-     * system memory, under the two added together. */
-    check(gs_catalogue_fit(7000000000LL, &card) == GS_FIT_PARTIAL,
-          "a model larger than either store alone splits across both");
-    check(gs_catalogue_fit(4500000000LL, &card) == GS_FIT_GRAPHICS,
-          "5,400,000,000 still fits inside a 6 GB card");
-    check(gs_catalogue_fit(9000000000LL, &card) == GS_FIT_NONE,
-          "a model larger than both together does not fit");
-
-    check(gs_catalogue_fit_name(GS_FIT_NONE) != NULL, "every fit has a name");
-    check(gs_catalogue_fit_name(GS_FIT_GRAPHICS) != NULL, "graphics has one");
-}
+/* A desk machine of a given size, with a reading of what is free. Passing
+ * nought for free means the platform would not say. */
 
 /* Every row the classifier is asked about, and the kind it has to answer.
  * All of these appear in data/catalogue.tsv. */
@@ -388,7 +351,10 @@ int main(void)
 
     test_contract();
     test_loading();
+    test_the_reserve();
     test_fit_arithmetic();
+    test_keeping_against_running();
+    test_many_at_once();
     test_kinds();
     test_every_row_classifies();
     test_runnable();

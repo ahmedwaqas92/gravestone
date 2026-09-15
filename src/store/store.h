@@ -43,6 +43,35 @@ int gs_store_latest(gs_detect_report_t *report, char *fingerprint,
 /* How many distinct configurations this machine has been through. */
 int gs_store_snapshot_count(void);
 
+/* One remembered model, as the last session found it on a disk. */
+typedef struct {
+    char      name[160];
+    char      path[512];
+    char      root[128];      /* the disk it was found under */
+    long long bytes;
+} gs_store_model_t;
+
+/* Settings kept between sessions, written as plain text against a key.
+ * A key never written reads back empty and reports GS_ERR. */
+int gs_store_setting_put(const char *key, const char *value);
+int gs_store_setting_get(const char *key, char *out, size_t cap);
+
+/* How many settings the file holds. Zero means the interface has never
+ * been configured, which is what puts the mark on the settings icon. */
+int gs_store_setting_count(void);
+
+/* The model inventory, written whenever a disk is walked so a later
+ * session knows what the user has without walking it again. Remember
+ * adds or replaces one model by name, forget empties the table. */
+int gs_store_model_remember(const char *name, const char *path,
+                            const char *root, long long bytes);
+int gs_store_model_forget_all(void);
+
+/* Reads the inventory into memory. Returns how many were read. */
+int gs_store_model_load(void);
+int gs_store_model_count(void);
+const gs_store_model_t *gs_store_model_at(int index);
+
 extern const gs_module gs_store_module;
 
 #endif

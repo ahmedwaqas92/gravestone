@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 #include <sys/types.h>
 
 #define GS_APP_DIR "gravestone"
@@ -28,9 +31,7 @@ void gs_paths_override(const char *dir)
  * holds task descriptions and generated code in plain text. */
 static int ensure_dir(const char *path)
 {
-    if (mkdir(path, 0700) == 0)
-        return GS_OK;
-    if (errno == EEXIST)
+    if (gs_paths_make_dir(path) == GS_OK)
         return GS_OK;
     gs_log_error("paths: cannot create %s: %s", path, strerror(errno));
     return GS_ERR_IO;
@@ -55,6 +56,23 @@ static int ensure_tree(const char *path)
         work[i] = '/';
     }
     return ensure_dir(work);
+}
+
+int gs_paths_make_dir(const char *path)
+{
+    int made;
+
+    if (path == NULL || path[0] == '\0')
+        return GS_ERR_ARG;
+
+#ifdef _WIN32
+    made = _mkdir(path);
+#else
+    made = mkdir(path, 0700);
+#endif
+    if (made == 0 || errno == EEXIST)
+        return GS_OK;
+    return GS_ERR_IO;
 }
 
 int gs_paths_data_dir(char *out, size_t cap)

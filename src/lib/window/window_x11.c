@@ -82,10 +82,13 @@ static int create_window(gs_window_t *w)
     gs_win_put32(req + 32, 0x00000000u);    /* background pixel, black */
 
     gs_win_put32(tail, 0x00000000u);        /* border pixel */
-    /* KeyPress 0x1, ButtonPress 0x4, PointerMotion 0x40,
-     * Exposure 0x8000, StructureNotify 0x20000 */
-    gs_win_put32(tail + 4, 0x00000001u | 0x00000004u | 0x00000040u |
-                           0x00008000u | 0x00020000u);
+    /* KeyPress 0x1, ButtonPress 0x4, ButtonRelease 0x8,
+     * PointerMotion 0x40, Exposure 0x8000, StructureNotify 0x20000.
+     *
+     * Release is asked for so a drag can end. A grip taken hold of and
+     * never let go would follow the pointer for ever. */
+    gs_win_put32(tail + 4, 0x00000001u | 0x00000004u | 0x00000008u |
+                           0x00000040u | 0x00008000u | 0x00020000u);
 
     w->sequence++;
     if (gs_win_write_all(w, req, sizeof req) != GS_OK) return GS_ERR_IO;
@@ -216,6 +219,16 @@ static int set_close_protocol(gs_window_t *w)
 
     if (intern_atom(w, "WM_PROTOCOLS", &w->atom_wm_protocols) != GS_OK)
         return GS_ERR;
+    /* A manager that does not know these leaves them at nothing, and the
+     * request to grow then reports that it could not be made. */
+    if (intern_atom(w, "_NET_WM_STATE", &w->atom_net_wm_state) != GS_OK)
+        w->atom_net_wm_state = 0;
+    if (intern_atom(w, "_NET_WM_STATE_MAXIMIZED_VERT",
+                    &w->atom_net_wm_max_vert) != GS_OK)
+        w->atom_net_wm_max_vert = 0;
+    if (intern_atom(w, "_NET_WM_STATE_MAXIMIZED_HORZ",
+                    &w->atom_net_wm_max_horz) != GS_OK)
+        w->atom_net_wm_max_horz = 0;
     if (intern_atom(w, "WM_DELETE_WINDOW", &w->atom_wm_delete) != GS_OK)
         return GS_ERR;
 
@@ -341,15 +354,17 @@ static int raise_window(gs_window_t *w)
 
 /* Asks the server what each key means. Keycodes are seat numbers with no
  * meaning of their own, and the keyboard map is the table that turns seat
- * 38 into the letter a. Only the unshifted column is kept, since the
- * search field wants plain letters and digits. */
+ * 38 into the letter a. Each seat carries several meanings in a row, and
+ * the first two are the key alone and the key with shift held, so both
+ * are kept. Keeping only the first is what makes shift and the oblique
+ * give an oblique rather than a question mark. */
 static int fetch_keymap(gs_window_t *w)
 {
     unsigned char req[8];
     unsigned char reply[32];
     unsigned char data[8192];
     size_t len = 0;
-    unsigned per, count, i;
+    unsigned per, count;
 
     if (w->max_keycode <= w->min_keycode)
         return GS_OK;
@@ -370,10 +385,31 @@ static int fetch_keymap(gs_window_t *w)
     per = reply[1];
     if (per == 0)
         return GS_OK;
-    for (i = 0; i < count && (size_t)(i * per + 1) * 4u <= len; i++)
-        w->keysym0[w->min_keycode + i] =
-            gs_win_get32(data + (size_t)i * per * 4u);
+    gs_win_read_keymap(data, len, per, count, w->min_keycode,
+                       w->keysym0, w->keysym1);
     return GS_OK;
+}
+
+void gs_win_read_keymap(const unsigned char *data, size_t len, unsigned per,
+                        unsigned count, unsigned first,
+                        uint32_t *plain, uint32_t *upper)
+{
+    unsigned i;
+
+    if (data == NULL || plain == NULL || upper == NULL || per == 0)
+        return;
+
+    for (i = 0; i < count && first + i < 256 &&
+                (size_t)(i * per + 1) * 4u <= len; i++) {
+        const unsigned char *row = data + (size_t)i * per * 4u;
+
+        plain[first + i] = gs_win_get32(row);
+        /* A seat with only one meaning shifts to the same thing. */
+        if (per >= 2 && (size_t)(i * per + 2) * 4u <= len)
+            upper[first + i] = gs_win_get32(row + 4);
+        else
+            upper[first + i] = plain[first + i];
+    }
 }
 
 static int map_window(gs_window_t *w)
@@ -473,9 +509,18 @@ int gs_window_position(gs_window_t *window, int *x, int *y)
 
 int gs_window_display_available(void)
 {
-    int display = gs_win_display_number();
+    int display;
     int fd;
 
+    /* A window opening takes the screen from whoever is working on it.
+     * Setting GS_TEST_NO_WINDOW says no screen is available, which every
+     * test already knows how to answer, so a whole run goes past without
+     * anything appearing. Checked here rather than in each test, since a
+     * test added later would otherwise have to remember. */
+    if (getenv("GS_TEST_NO_WINDOW") != NULL)
+        return 0;
+
+    display = gs_win_display_number();
     if (display < 0)
         return 0;
     fd = gs_win_connect(display);
@@ -483,6 +528,13 @@ int gs_window_display_available(void)
         return 0;
     close(fd);
     return 1;
+}
+
+/* Nothing opens while windows are turned off, so a test that forgets to
+ * ask cannot put one on the screen either. */
+static int windows_are_off(void)
+{
+    return getenv("GS_TEST_NO_WINDOW") != NULL;
 }
 
 gs_window_t *gs_window_open(const char *title, int width, int height)
@@ -500,6 +552,11 @@ gs_window_t *gs_window_open(const char *title, int width, int height)
         return NULL;
     }
 
+    if (windows_are_off()) {
+        gs_log_debug("window: windows are turned off, opening nothing");
+        return NULL;
+    }
+
     display = gs_win_display_number();
     if (display < 0)
         return NULL;
@@ -511,6 +568,10 @@ gs_window_t *gs_window_open(const char *title, int width, int height)
     w->width = width;
     w->height = height;
     w->id_next = 1;
+    /* Zero is the arrow, so a fresh window would skip the first request
+     * for it. Starting outside the range makes the first ask always go
+     * out, whichever shape it is for. */
+    w->cursor_now = -1;
 
     w->fd = gs_win_connect(display);
     if (w->fd < 0) {
@@ -621,6 +682,11 @@ int gs_window_width(const gs_window_t *window)
 int gs_window_height(const gs_window_t *window)
 {
     return window != NULL ? window->height : 0;
+}
+
+int gs_window_connected(const gs_window_t *window)
+{
+    return window != NULL && !window->broken && window->fd >= 0;
 }
 
 int gs_window_error_count(const gs_window_t *window)

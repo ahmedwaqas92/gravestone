@@ -12,6 +12,11 @@
 #include "catalogue.h"
 #include "detect.h"
 #include "library.h"
+#include "harness.h"
+#include "provider.h"
+#include "session.h"
+#include "verify.h"
+#include "mount.h"
 #include "store.h"
 #include "ui.h"
 
@@ -21,9 +26,14 @@
 static const gs_module *const modules[] = {
     &gs_ui_module,
     &gs_detect_module,
+    &gs_mount_module,
     &gs_store_module,
     &gs_catalogue_module,
     &gs_library_module,
+    &gs_session_module,
+    &gs_provider_module,
+    &gs_verify_module,
+    &gs_harness_module,
 };
 
 static const int module_count = (int)(sizeof modules / sizeof modules[0]);

@@ -24,4 +24,9 @@ int gs_paths_db_file(char *out, size_t cap);
  * puts the real one back. */
 void gs_paths_override(const char *dir);
 
+/* Makes one directory, with the permissions that matter on the systems
+ * that carry them. An existing directory counts as success. Wrapped
+ * here because Windows takes no permission argument at all. */
+int gs_paths_make_dir(const char *path);
+
 #endif

@@ -19,16 +19,15 @@
 #include <stdio.h>
 #include <string.h>
 
-#define PANE_PAD 10
 
-static int panes_visible(int w, int h)
+int gs_ui_panes_visible(int w, int h)
 {
     return w >= GS_UI_MARGIN * 2 + 240 &&
            h >= GS_UI_PANE_TOP + GS_UI_PANE_HEADER + GS_UI_ROW_HEIGHT;
 }
 
 /* One row of a pane, in window pixels. */
-static gs_ui_rect_t row_rect(gs_ui_rect_t pane, int slot)
+gs_ui_rect_t gs_ui_pane_row_rect(gs_ui_rect_t pane, int slot)
 {
     gs_ui_rect_t r;
 
@@ -52,9 +51,9 @@ static void shade_rows(unsigned int *px, int w, int h, gs_ui_rect_t pane,
         if (index >= count)
             break;
         if (index == selected)
-            gs_ui_px_rect(px, w, h, row_rect(pane, slot), GS_UI_ROW_PICKED);
+            gs_ui_px_rect(px, w, h, gs_ui_pane_row_rect(pane, slot), GS_UI_ROW_PICKED);
         else if (state->hover == mine && state->hover_row == index)
-            gs_ui_px_rect(px, w, h, row_rect(pane, slot), GS_UI_ROW_HOVER);
+            gs_ui_px_rect(px, w, h, gs_ui_pane_row_rect(pane, slot), GS_UI_ROW_HOVER);
     }
 }
 
@@ -91,12 +90,51 @@ static void draw_arrow(unsigned int *px, int w, int h, int cx, int cy,
     }
 }
 
+/* The tag for one row of the model list, with the pill placed inside the
+ * row. Both drawing passes call this, so the shape and the words land in
+ * the same place.
+ *
+ * The size sits at the right edge of the words, the tag to the left of
+ * it, and both stop before the mark that pulls a model. Returns nought when
+ * the row has no tag, or when the row is too narrow to carry one without
+ * covering the model name. */
+int gs_ui_row_tag(gs_ui_rect_t pane, int slot, int index,
+                   gs_ui_tag_t *out)
+{
+    const gs_catalogue_entry_t *entry = gs_ui_panes_model(index);
+    const gs_detect_report_t *machine = gs_ui_panes_machine();
+    gs_ui_rect_t row = gs_ui_pane_row_rect(pane, slot);
+    int glyph = gs_ui_glyph_width();
+
+    if (entry == NULL || glyph <= 0)
+        return 0;
+    if (!gs_ui_model_tag(entry->bytes, machine, out))
+        return 0;
+
+    /* A fixed column for the size, wide enough for the longest byte count
+     * this ever prints. Measuring the actual string instead would move
+     * every tag by a character or two, so the pills would sit ragged down
+     * the list and a short size would let its row's tag drift right into
+     * it. */
+    /* The tag stops where the mark begins, so the two never touch. */
+    row.w = gs_ui_row_mark_rect(row).x - row.x;
+    out->box.x = row.x + row.w - GS_UI_PANE_PAD - GS_UI_SIZE_COLUMN * glyph
+               - GS_UI_TAG_GAP - out->box.w;
+    out->box.y = row.y + (row.h - out->box.h) / 2;
+
+    /* A pane too narrow to hold the tag and still show part of a name
+     * drops the tag rather than covering the name with it. */
+    if (out->box.x < row.x + GS_UI_PANE_PAD + 4 * glyph)
+        return 0;
+    return 1;
+}
+
 void gs_ui_panes_compose(unsigned int *px, int w, int h,
                          const gs_ui_state_t *state)
 {
     gs_ui_rect_t chooser, left, mid, right, drop;
 
-    if (state == NULL || !panes_visible(w, h))
+    if (state == NULL || !gs_ui_panes_visible(w, h))
         return;
 
     chooser = gs_ui_chooser_rect(w, h);
@@ -106,6 +144,33 @@ void gs_ui_panes_compose(unsigned int *px, int w, int h,
                      GS_UI_BTN_EDGE);
     draw_arrow(px, w, h, chooser.x + chooser.w - 16,
                chooser.y + chooser.h / 2, state->chooser_open);
+
+    /* The way back to the home screen, an arrow pointing left. */
+    {
+        gs_ui_rect_t back = gs_ui_back_rect(w, h);
+
+        if (back.w > 0) {
+            int cx = back.x + back.w / 2 + 2;
+            int cy = back.y + back.h / 2;
+            unsigned int ink = state->hover == GS_UI_HIT_BACK
+                                   ? GS_UI_BTN_LABEL : GS_UI_ROW_DIM;
+            int step;
+
+            gs_ui_px_rounded(px, w, h, back, 4,
+                             state->hover == GS_UI_HIT_BACK
+                                 ? GS_UI_BTN_FACE_HOVER : GS_UI_BTN_FACE,
+                             GS_UI_BTN_EDGE);
+            for (step = 0; step < 6; step++) {
+                int reach = step < 3 ? step : 5 - step;
+
+                gs_ui_px_rect(px, w, h,
+                              (gs_ui_rect_t){cx - 5 + step, cy - reach,
+                                             1, reach * 2 + 1}, ink);
+            }
+            gs_ui_px_rect(px, w, h, (gs_ui_rect_t){cx - 1, cy - 1, 6, 3},
+                          ink);
+        }
+    }
 
     left = gs_ui_left_rect(w, h);
     mid = gs_ui_mid_rect(w, h);
@@ -131,6 +196,61 @@ void gs_ui_panes_compose(unsigned int *px, int w, int h,
     shade_rows(px, w, h, right, state, GS_UI_HIT_RIGHT_ROW,
                state->library_scroll, state->library_count, -1);
 
+    /* A bar down the right of each pane, so a reader twenty rows into two
+     * thousand can tell that from twenty rows into thirty. */
+    {
+        static const struct { int which; } order[3] = { {0}, {1}, {2} };
+        int k;
+
+        for (k = 0; k < 3; k++) {
+            gs_ui_rect_t pane;
+            gs_ui_rect_t list;
+            gs_ui_rect_t rail, grip;
+            int total, scroll;
+
+            if (order[k].which == 0) {
+                pane = left;
+                total = state->model_count;
+                scroll = state->model_scroll;
+            } else if (order[k].which == 1) {
+                pane = mid;
+                total = state->disk_count;
+                scroll = 0;
+            } else {
+                pane = right;
+                total = state->library_count;
+                scroll = state->library_scroll;
+            }
+
+            /* The bar runs beside the rows, clear of the header above
+             * them. */
+            list = pane;
+            list.y += GS_UI_PANE_HEADER;
+            list.h -= GS_UI_PANE_HEADER;
+            if (!gs_ui_scrollbar(list, total, gs_ui_pane_rows(pane), scroll,
+                                 &rail, &grip))
+                continue;
+            gs_ui_px_rounded(px, w, h, rail, 2, GS_UI_SCROLL_RAIL,
+                             GS_UI_SCROLL_RAIL);
+            gs_ui_px_rounded(px, w, h, grip, 2, GS_UI_SCROLL_GRIP,
+                             GS_UI_SCROLL_GRIP);
+        }
+    }
+
+    /* The pill behind each tag, filled here and lettered in the pass that
+     * has a window to draw glyphs through. */
+    {
+        int rows = gs_ui_pane_rows(left);
+        int slot;
+
+        for (slot = 0; slot < rows; slot++) {
+            gs_ui_tag_t tag;
+
+            if (gs_ui_row_tag(left, slot, state->model_scroll + slot, &tag))
+                gs_ui_px_rounded(px, w, h, tag.box, 3, tag.face, tag.face);
+        }
+    }
+
     /* The open list covers the panes, so it goes on last. It holds the
      * categories, which fit without scrolling. */
     if (state->chooser_open) {
@@ -153,222 +273,6 @@ void gs_ui_panes_compose(unsigned int *px, int w, int h,
             else if (state->hover == GS_UI_HIT_DROP_ROW &&
                      state->hover_row == slot)
                 gs_ui_px_rect(px, w, h, r, GS_UI_ROW_HOVER);
-        }
-    }
-}
-
-/* ---- text ---- */
-
-/* Copies as much of in as fits inside max pixels, marking a cut with two
- * dots. The server owns the font, so the width has to be asked for rather
- * than worked out from the character count. */
-static void fit_text(gs_window_t *win, const char *in, int max, char *out,
-                     size_t cap)
-{
-    size_t n;
-
-    out[0] = '\0';
-    if (in == NULL || max <= 0 || cap < 4)
-        return;
-
-    gs_str_copy(out, cap, in);
-    if (gs_window_text_width(win, out) <= max)
-        return;
-
-    /* Take one character off the end and stand two dots where the cut was,
-     * until what is left measures small enough. The characters that the
-     * dots covered are put back before the next character comes off, so
-     * the string is always the original shortened rather than a string
-     * that has had dots eaten into it. */
-    for (n = strlen(out); n > 2; n--) {
-        out[n - 1] = '\0';
-        out[n - 3] = '.';
-        out[n - 2] = '.';
-        if (gs_window_text_width(win, out) <= max)
-            return;
-        out[n - 3] = in[n - 3];
-        out[n - 2] = in[n - 2];
-    }
-    out[0] = '\0';
-}
-
-/* A row's repository reads library/<model>, and the file column already
- * carries <model>:<tag>, so the part before the slash buys nothing. */
-static const char *short_name(const char *repository)
-{
-    const char *slash = strrchr(repository, '/');
-
-    return slash != NULL ? slash + 1 : repository;
-}
-
-static int baseline(gs_ui_rect_t r, gs_window_t *win)
-{
-    return r.y + (r.h + gs_window_font_ascent(win)) / 2 - 1;
-}
-
-/* Draws a row as a name on the left and a short value on the right, with
- * the name cut back to whatever width the value leaves. */
-static void draw_row(gs_window_t *win, gs_ui_rect_t r, const char *name,
-                     const char *value, unsigned int name_colour)
-{
-    char cut[192];
-    int y = baseline(r, win);
-    int value_w = value != NULL ? gs_window_text_width(win, value) : 0;
-    int room = r.w - 2 * PANE_PAD - value_w - (value_w > 0 ? 10 : 0);
-
-    fit_text(win, name, room, cut, sizeof cut);
-    if (cut[0] != '\0')
-        gs_window_text(win, r.x + PANE_PAD, y, cut, name_colour);
-    if (value_w > 0 && value_w < r.w - 2 * PANE_PAD)
-        gs_window_text(win, r.x + r.w - PANE_PAD - value_w, y, value,
-                       GS_UI_ROW_DIM);
-}
-
-static void draw_header(gs_window_t *win, const gs_ui_state_t *state,
-                        gs_ui_rect_t pane, const char *text, int count)
-{
-    char tally[16];
-    gs_ui_rect_t head = pane;
-
-    head.h = GS_UI_PANE_HEADER - 4;
-    if (gs_ui_text_covered(state, gs_window_width(win),
-                           gs_window_height(win), head))
-        return;
-    snprintf(tally, sizeof tally, "%d", count);
-    draw_row(win, head, text, tally, GS_UI_HEADER_TEXT);
-}
-
-static void model_line(const gs_catalogue_entry_t *entry, char *out,
-                       size_t cap)
-{
-    if (entry->quantisation[0] != '\0')
-        snprintf(out, cap, "%s  %s", short_name(entry->repository),
-                 entry->quantisation);
-    else
-        gs_str_copy(out, cap, short_name(entry->repository));
-}
-
-void gs_ui_panes_labels(gs_window_t *win, const gs_ui_state_t *state)
-{
-    int w, h, rows, slot;
-    gs_ui_rect_t chooser, left, mid, right, r;
-    char line[192], size[32];
-
-    if (win == NULL || state == NULL)
-        return;
-    w = gs_window_width(win);
-    h = gs_window_height(win);
-    if (!panes_visible(w, h))
-        return;
-    if (gs_ui_confirm_visible(state))
-        return;
-
-    /* The bar across the top names the category the left pane is showing
-     * and how many models are in it. */
-    chooser = gs_ui_chooser_rect(w, h);
-    snprintf(line, sizeof line, "%s",
-             gs_ui_panes_category_name(state->category_sel));
-    snprintf(size, sizeof size, "%d", state->model_count);
-    r = chooser;
-    r.w -= 22;
-    draw_row(win, r, line, size, GS_UI_BTN_LABEL);
-
-    left = gs_ui_left_rect(w, h);
-    mid = gs_ui_mid_rect(w, h);
-    right = gs_ui_right_rect(w, h);
-
-    draw_header(win, state, left, "MODELS THAT FIT", state->model_count);
-
-    /* The search text sits inside its box, dim guidance when empty, and
-     * cut back rather than allowed to spill over the count. */
-    {
-        gs_ui_rect_t box = gs_ui_search_rect(w, h);
-
-        if (box.w > 0 && !gs_ui_text_covered(state, w, h, box)) {
-            char cut[64];
-            int have = state->search[0] != '\0';
-            int y = baseline(box, win);
-
-            fit_text(win, have ? state->search : "type to search",
-                     box.w - 10, cut, sizeof cut);
-            if (cut[0] != '\0')
-                gs_window_text(win, box.x + 5, y, cut,
-                               have ? GS_UI_ROW_TEXT : GS_UI_ROW_DIM);
-        }
-    }
-    draw_header(win, state, mid, "DISKS", state->disk_count);
-    draw_header(win, state, right, "ON THIS DISK", state->library_count);
-
-    rows = gs_ui_pane_rows(left);
-    for (slot = 0; slot < rows; slot++) {
-        int index = state->model_scroll + slot;
-        const gs_catalogue_entry_t *entry = gs_ui_panes_model(index);
-
-        if (entry == NULL)
-            break;
-        if (gs_ui_text_covered(state, w, h, row_rect(left, slot)))
-            continue;
-        model_line(entry, line, sizeof line);
-        gs_str_bytes(entry->bytes, size, sizeof size);
-        r = row_rect(left, slot);
-        r.w -= 18;                /* room for the + that pulls it */
-        draw_row(win, r, line, size,
-                 index == state->model_sel ? GS_UI_BTN_LABEL
-                                           : GS_UI_ROW_TEXT);
-        gs_window_text(win, left.x + left.w - 14, baseline(r, win), "+",
-                       state->hover == GS_UI_HIT_LEFT_ADD &&
-                       state->hover_row == index ? 0x0060C080u
-                                                 : GS_UI_ROW_DIM);
-    }
-
-    rows = gs_ui_pane_rows(mid);
-    for (slot = 0; slot < rows; slot++) {
-        const gs_detect_disk_t *disk = gs_ui_panes_disk(slot);
-
-        if (disk == NULL)
-            break;
-        if (gs_ui_text_covered(state, w, h, row_rect(mid, slot)))
-            continue;
-        gs_str_bytes(disk->free_bytes, size, sizeof size);
-        draw_row(win, row_rect(mid, slot), disk->mount, size,
-                 slot == state->disk_sel ? GS_UI_BTN_LABEL : GS_UI_ROW_TEXT);
-    }
-
-    rows = gs_ui_pane_rows(right);
-    for (slot = 0; slot < rows; slot++) {
-        int index = state->library_scroll + slot;
-        const gs_library_entry_t *entry = gs_library_at(index);
-
-        if (entry == NULL)
-            break;
-        if (gs_ui_text_covered(state, w, h, row_rect(right, slot)))
-            continue;
-        gs_str_bytes(entry->bytes, size, sizeof size);
-        r = row_rect(right, slot);
-        r.w -= 18;                /* room for the x that removes it */
-        draw_row(win, r, entry->name, size, GS_UI_ROW_TEXT);
-        gs_window_text(win, right.x + right.w - 14, baseline(r, win), "x",
-                       state->hover == GS_UI_HIT_RIGHT_REMOVE &&
-                       state->hover_row == index ? 0x00D07060u
-                                                 : GS_UI_ROW_DIM);
-    }
-
-    /* The open list sits over the panes, so its rows are drawn last. */
-    if (state->chooser_open) {
-        gs_ui_rect_t drop = gs_ui_drop_rect(w, h, state->category_count);
-
-        for (slot = 0; slot < state->category_count; slot++) {
-            r.x = drop.x;
-            r.y = drop.y + 4 + slot * GS_UI_ROW_HEIGHT;
-            r.w = drop.w;
-            r.h = GS_UI_ROW_HEIGHT;
-            if (r.y + r.h > drop.y + drop.h)
-                break;
-            snprintf(size, sizeof size, "%d",
-                     gs_ui_panes_category_total(slot));
-            draw_row(win, r, gs_ui_panes_category_name(slot), size,
-                     slot == state->category_sel ? GS_UI_BTN_LABEL
-                                                 : GS_UI_ROW_TEXT);
         }
     }
 }

@@ -83,8 +83,8 @@ static void test_keys_and_title(void)
     check(GS_UI_SPECS_TITLE[0] >= 'A' && GS_UI_SPECS_TITLE[0] <= 'Z',
           "the specs window title starts with a capital too");
 
-    check(gs_ui_key_closes(9), "Escape closes the window");
-    check(!gs_ui_key_closes(24), "q leaves the window open");
+    check(gs_ui_key_closes(27), "Escape closes the window");
+    check(!gs_ui_key_closes('q'), "q leaves the window open");
 
     for (code = 0; code < 256; code++)
         if (gs_ui_key_closes(code))
@@ -179,6 +179,18 @@ static void test_pane_geometry(void)
 
     check(chooser.y + chooser.h <= left.y,
           "the chooser sits clear of the panes");
+    {
+        gs_ui_rect_t back = gs_ui_back_rect(w, h);
+
+        check(back.w > 0, "the back arrow exists at the normal size");
+        check(chooser.x + chooser.w <= back.x,
+              "and the chooser stops short of it");
+        check(back.x + back.w <= w - GS_UI_MARGIN,
+              "with the arrow inside the margin");
+        check(back.y >= chooser.y &&
+              back.y + back.h <= chooser.y + chooser.h,
+              "and level with the chooser row");
+    }
     check(left.x >= GS_UI_MARGIN, "the left pane keeps the margin");
     check(left.x + left.w < mid.x, "the left pane ends before the middle");
     check(mid.x + mid.w < right.x, "the middle ends before the right");
@@ -308,9 +320,11 @@ static void test_button_appearance(void)
           "the mount control looks the same either way");
 
     {
-        gs_ui_state_t hover = on;
-        gs_ui_state_t down = on;
+        static gs_ui_state_t hover;   /* a megabyte, kept off the stack */
+        static gs_ui_state_t down;    /* a megabyte, kept off the stack */
 
+        hover = on;
+        down = on;
         hover.hover = GS_UI_HIT_MOUNT;
         down.pressed = GS_UI_HIT_MOUNT;
 
@@ -730,8 +744,12 @@ int main(void)
 {
     gs_log_set_level(GS_LOG_ERROR);
 
+    /* Both shared states describe the workspace, since every control
+     * the tests below reach for lives on that screen. */
     memset(&off, 0, sizeof off);
+    off.screen = GS_UI_SCREEN_WORKSPACE;
     memset(&on, 0, sizeof on);
+    on.screen = GS_UI_SCREEN_WORKSPACE;
     on.mounted = 1;
     gs_str_copy(on.status, sizeof on.status, "DEVICE MOUNTED");
     gs_str_copy(off.status, sizeof off.status, "NO DEVICE MOUNTED");

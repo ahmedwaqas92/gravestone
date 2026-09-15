@@ -87,6 +87,11 @@ static int load_or_create_install(void)
     return GS_OK;
 }
 
+gs_db_t *gs_store_handle(void)
+{
+    return db;
+}
+
 int gs_store_open(void)
 {
     char path[512];

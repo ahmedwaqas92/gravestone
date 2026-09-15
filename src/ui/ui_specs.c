@@ -55,6 +55,20 @@ void gs_ui_draw_labels(gs_window_t *window, const gs_ui_state_t *state)
     if (width < GS_UI_MARGIN * 2 + 80)
         return;
 
+    /* The password box covers whichever screen is underneath, and words
+     * are drawn through the glass after the image, so anything else
+     * written now would sit on top of the box rather than behind it. Its
+     * words are the only words while it is up. */
+    if (gs_ui_secret_visible(state)) {
+        gs_ui_secret_labels(window, state);
+        return;
+    }
+
+    if (state->screen == GS_UI_SCREEN_HOME) {
+        gs_ui_home_labels(window, state);
+        return;
+    }
+
     /* With the confirm box up, its words are the only words. Text drawn
      * after the image would sit on top of the box, so everything else
      * stays unwritten until the box is answered. */

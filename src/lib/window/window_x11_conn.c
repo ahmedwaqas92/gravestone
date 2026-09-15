@@ -19,6 +19,25 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+/* Linux asks for the quiet write one call at a time, and macOS asks for it
+ * once on the socket. A system with neither leaves the flag at nothing,
+ * which is the same as asking for nothing, so the build still works and
+ * the old behaviour comes back. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+static void quiet_writes(int fd)
+{
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#else
+    (void)fd;
+#endif
+}
+
 void gs_win_put16(unsigned char *p, uint16_t v)
 {
     p[0] = (unsigned char)(v & 0xff);
@@ -55,7 +74,12 @@ int gs_win_write_all(struct gs_window *w, const void *buf, size_t len)
     size_t sent = 0;
 
     while (sent < len) {
-        ssize_t n = write(w->fd, p + sent, len - sent);
+        /* send rather than write, because a write to a socket the server
+         * has already closed raises a pipe signal, and the default
+         * behaviour for that signal is to end the program on the spot.
+         * The error below is the answer this code is written to give, and
+         * it never runs while the signal gets there first. */
+        ssize_t n = send(w->fd, p + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
@@ -129,6 +153,7 @@ int gs_win_connect(int display_number)
         gs_log_error("window: socket failed: %s", strerror(errno));
         return -1;
     }
+    quiet_writes(fd);
 
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
